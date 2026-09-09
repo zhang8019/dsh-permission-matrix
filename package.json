@@ -1,8 +1,7 @@
 {
   "name": "dsh-permission-matrix",
   "version": "0.1.0",
-  "private": true,
-  "description": "Permission matrix for DeepSeek Harness: 3 sandbox modes x 4 approval strategies as 9 selectable presets, with a global default and a separate LLM-robot (social-channel) default.",
+  "description": "Permission matrix for DeepSeek Harness: 3 sandbox modes x 4 approval strategies = 9 selectable presets, with a global default, a separate LLM-robot default, three-tier risk policies, audit log and git checkpoint.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -17,7 +16,8 @@
     "src",
     "cordis.patch.yml",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -29,6 +29,33 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "permission",
+    "permission-preset",
+    "sandbox",
+    "approval",
+    "risk-classifier",
+    "auto-approve"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhang8019/dsh-permission-matrix.git"
+  },
+  "homepage": "https://github.com/zhang8019/dsh-permission-matrix#readme",
+  "bugs": {
+    "url": "https://github.com/zhang8019/dsh-permission-matrix/issues"
+  },
+  "author": "zhang8019",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/decide.test.js tests/hooks.test.js",
+    "check": "node --check src/index.js && node --check src/client/index.js && npm test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^0.1.2-rc.1",
