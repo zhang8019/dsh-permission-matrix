@@ -1,0 +1,77 @@
+# dsh-permission-matrix bundle patch — 权限矩阵（3 沙箱 × 4 审批 = 9 预设）。
+#
+# 贡献：
+#  1. `permission` 行 override：把预设表整体替换为 9 个组合预设。
+#     注意 DSH 的 patch 是「按 id 整行替换 config」，因此这里 restate 全表；
+#     `dsh-auto-classifier` 必须同时 disabled，否则两者争抢同一行。
+#  2. `permission-matrix` 行：本插件的 host 半侧。
+#
+# 关键约束：`@deepseek-ai/dsh-user-approval` 的 APPROVAL_POLICIES 只有
+# `ask` / `never` 两个合法值。因此「人工审批 / 自动同意 / 自动风险审批」三档
+# 在预设表里统一写 `approval: ask`，由本插件依据当前会话预设名分流：
+#   - 人工审批      → 插件不干预，交给浏览器应答者
+#   - 自动同意      → 插件在 approval/request 返回 allowed-once（带硬拒绝保护）
+#   - 自动风险审批  → 插件在 tools/pre-execute + approval/request 分级裁决
+# 「自动拒绝」档写 `never`，由 DSH 原生确定性拒绝，插件不干预。
+
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    defaultPreset: ww-human
+    presets:
+      ro-human:
+        sandbox: read-only
+        approval: ask
+        name: '工作区只读权限 + 人工审批'
+        description: '只读沙箱：一切写入被拒绝，越权操作需人工批准'
+      ro-deny:
+        sandbox: read-only
+        approval: never
+        name: '工作区只读权限 + 自动拒绝'
+        description: '只读沙箱：写入一律拒绝，无人审批环节（真正只读）'
+      ww-human:
+        sandbox: workspace-write
+        approval: ask
+        name: '工作区读写权限 + 人工审批'
+        description: '工作区内可写；越界操作需人工批准'
+      ww-classify:
+        sandbox: workspace-write
+        approval: ask
+        name: '工作区读写权限 + 自动风险审批'
+        description: '工作区内可写；越界与高风险操作按风险分级自动裁决'
+      ww-deny:
+        sandbox: workspace-write
+        approval: never
+        name: '工作区读写权限 + 自动拒绝'
+        description: '工作区内可写；越界操作一律拒绝'
+      fa-human:
+        sandbox: danger-full-access
+        approval: ask
+        name: '全电脑读写权限 + 人工审批'
+        description: '文件全放行；需批准的操作交给人工'
+      fa-deny:
+        sandbox: danger-full-access
+        approval: never
+        name: '全电脑读写权限 + 自动拒绝'
+        description: '文件全放行；需批准的操作一律拒绝'
+      fa-auto:
+        sandbox: danger-full-access
+        approval: ask
+        name: '全电脑读写权限 + 自动同意'
+        description: '文件全放行；需批准的操作自动放行（极高风险仍硬拒绝）'
+      fa-classify:
+        sandbox: danger-full-access
+        approval: ask
+        name: '全电脑读写权限 + 自动风险审批'
+        description: '文件全放行；操作按风险分级自动裁决'
+
+- insert:
+    - id: permission-matrix
+      name: 'dsh-permission-matrix'
+      config:
+        enabled: true
+        # 本插件在哪几个预设下接管审批（其余预设全程 next()，行为与原生一致）
+        takeover:
+          fa-auto: auto-allow
+          ww-classify: classify
+          fa-classify: classify

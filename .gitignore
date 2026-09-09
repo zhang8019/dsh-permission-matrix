@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 本地验证用（不入库）
+_p0-verify.patch.yml
+_restart-dsh.ps1
+_kb-*.mjs
+_p0-*.yml
+pm-screenshot.png
+
+# 编辑器
+.vscode/
+.idea/

@@ -1,0 +1,38 @@
+{
+  "name": "dsh-permission-matrix",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Permission matrix for DeepSeek Harness: 3 sandbox modes x 4 approval strategies as 9 selectable presets, with a global default and a separate LLM-robot (social-channel) default.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "default": "./src/client/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "^0.1.2-rc.1"
+  },
+  "license": "MIT"
+}
