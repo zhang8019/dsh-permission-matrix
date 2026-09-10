@@ -2,22 +2,23 @@
  * 决策核心：纯函数、无 I/O、可单测。
  *
  * 判定顺序（与设计说明书 §6.1 一致）：
- *   1. HARD（极高风险）→ `deny`（人工也不能批准）
- *   2. 工作区内结构放行（write/edit/read 且目标在会话工作区内，受保护目标除外）→ `allow`
- *   3. ALLOW 规则 → `allow`
- *   4. 返回 `null`：交给调用方跑 LLM 裁判 / 中档策略
+ *   1. HARD（极高风险）→ `deny`（默认）或 `ask`（双重人工确认，见 index.js）
+ *   2. HIGH（高风险）→ `riskPolicies.high` 策略；递归删除对工作区内路径豁免
+ *   3. 工作区内结构放行（write/edit/read 且目标在会话工作区内，受保护目标除外）→ `allow`
+ *   4. ALLOW 规则 → `allow`
+ *   5. 返回 `null`：交给调用方跑 LLM 裁判 / 中档策略
  *
  * @module dsh-permission-matrix/decide
  */
 
 import path from 'node:path'
-import { ALLOW_RULES, HARD_DENY_RULES, PROTECTED_TARGETS, projectTarget } from './rules.js'
+import { ALLOW_RULES, executionSurface, HARD_DENY_RULES, HIGH_RISK_RULES, PROTECTED_TARGETS, projectTarget, READ_PATH_TOOLS } from './rules.js'
 
 /** 决策结果的风险级。 */
-export const RISK = Object.freeze({ LOW: 'low', MEDIUM: 'medium', HARD: 'hard' })
+export const RISK = Object.freeze({ LOW: 'low', MEDIUM: 'medium', HIGH: 'high', HARD: 'hard' })
 
-/** 命令类工具里「会写文件系统」的命令前缀（用于收窄系统目录判定）。 */
-const WRITE_COMMAND_PATTERN = /^\s*(copy|move|remove|rename|del|erase|set-content|add-content|clear-content|out-file|new-item|mkdir|md|attrib|icacls|takeown)/i
+/** 命令类工具里「会写文件系统」的命令前缀（用于收窄系统目录/配置判定）。 */
+const WRITE_COMMAND_PATTERN = /^\s*(copy|move|remove|rmdir|rd|rename|del|erase|set-content|add-content|clear-content|out-file|new-item|mkdir|md|attrib|icacls|takeown)/i
 
 /**
  * Windows 大小写不敏感、路径分隔符归一化的比较键。
@@ -43,7 +44,10 @@ export function isInside(target, workspace) {
 
 /**
  * 目标是否为受保护目标（即使在区内也不放行）。
+ * 只读工具（read/read_image）读取 `.dsh` / `.git` 元数据（非凭据）放行——
+ * 读取配置不是篡改（2026-09-09 实测 D 类误拦）；写工具依旧拦截。
  * @param {string} target - 目标路径。
+ * @param {string} toolName - 工具名。
  * @returns {boolean} 是否受保护。
  */
 export function isProtected(target, toolName) {
@@ -51,6 +55,10 @@ export function isProtected(target, toolName) {
   // 例外：本插件自己的审计目录只放裁决日志（不含密钥），允许 `read` 读取，
   // 否则插件会拦住对自己产物的自检；写入仍然拦截。
   if (toolName === 'read' && /[\\/]\.dsh[\\/]permission-matrix[\\/]/i.test(value)) return false
+  // 只读工具读取 .dsh / .git 元数据（非凭据路径）→ 放行；凭据仍拦。
+  if (READ_PATH_TOOLS.includes(toolName) && !/credentials|id_(rsa|ed25519)/i.test(value)) {
+    if (/\.dsh[\\/]|\.git[\\/]/i.test(value)) return false
+  }
   return PROTECTED_TARGETS.some((pattern) => pattern.test(value))
 }
 
@@ -67,32 +75,82 @@ export function resolveTarget(raw, workspace) {
   return path.resolve(workspace || process.cwd(), text)
 }
 
+/** 提取命令文本中第一个「路径状」token（绝对盘符 / 家目录 / 相对路径）。 */
+export function firstDeleteTarget(text) {
+  // 先去掉引号：路径常被引号包裹（含空格/特殊字符），如 rm -rf "./dist"、"C:\x"
+  const value = String(text ?? '').replace(/["']/g, '')
+  const abs = value.match(/[a-zA-Z]:[\\/][^\s;|&"']*/)
+  if (abs) return abs[0].replace(/[\\/]+$/, '')
+  const home = value.match(/(?:~|\$HOME)[\\/][^\s;|&"']*/i)
+  if (home) return home[0].replace(/[\\/]+$/, '')
+  const rel = value.match(/(?:^|[\s;|&])(?!-)([^\s;|&"'`]+[\\/][^\s;|&"'`]*)/)
+  if (rel) return rel[1].replace(/[\\/]+$/, '')
+  return ''
+}
+
+/**
+ * 命令文本中的删除目标是否位于工作区内（用于 HIGH 递归删除豁免）。
+ * @param {string} text - 命令原文（未剥离引号，路径常在引号内）。
+ * @param {string} workspace - 会话工作区。
+ * @returns {boolean} 目标是否在工作区内。
+ */
+export function isWorkspaceDelete(text, workspace) {
+  const target = firstDeleteTarget(text)
+  if (target === '') return false
+  if (/^[a-zA-Z]:[\\/]/.test(target)) return isInside(path.resolve(target), workspace)
+  if (/^~[\\/]|\$HOME/i.test(target)) return false // 家目录路径不算工作区
+  const resolved = path.resolve(workspace, target)
+  return isInside(resolved, workspace)
+}
+
 /**
  * 规则层裁决。返回 `null` 表示规则未命中，需上层继续（LLM 裁判 / 中档策略）。
  * @param {object} input - 输入。
  * @param {string} input.toolName - 工具名。
  * @param {object} input.args - 工具参数。
  * @param {string} input.workspace - 会话工作区。
- * @returns {{decision: 'allow' | 'deny', risk: string, rule: string, note?: string} | null} 裁决，或 null。
+ * @returns {{decision: 'allow' | 'deny' | 'ask', risk: string, rule: string, note?: string} | null} 裁决，或 null。
  */
 export function classifyByRules({ toolName, args, workspace }) {
   const target = projectTarget(toolName, args)
+  const surface = target.kind === 'command' ? executionSurface(target.text) : ''
 
-  // 1) HARD —— 最高优先，任何策略都不能推翻
+  // 1) HARD —— 最高优先，任何 lower 档策略都不能推翻
   if (target.text !== '') {
     for (const rule of HARD_DENY_RULES) {
-      // `hard:protected-path`（系统目录）判定收窄：
-      //  - 路径类工具（write/edit）一律判定；
+      const isReadOnlyPathTool = target.kind === 'path' && READ_PATH_TOOLS.includes(toolName)
+      // `hard:protected-path`（系统目录）与 `hard:dsh-config`（DSH 配置）判定收窄：
+      //  - 只读路径工具（read/read_image）读取系统文件/配置 → 放行（读取不是写入）；
       //  - 命令类工具只有「写命令」才判定——`Get-Content 'C:\Program Files\…'`
-      //    是读取（如查看插件源码），此前被误判为「系统目录写入」（2026-09-09 实测）。
-      if (rule.id === 'hard:protected-path' && target.kind !== 'path' && !WRITE_COMMAND_PATTERN.test(target.text)) continue
-      if (rule.test.test(target.text)) {
+      //    或 `[IO.File]::ReadAllText(...settings.yaml)` 是读取（2026-09-09 实测误拦）。
+      if ((rule.id === 'hard:protected-path' || rule.id === 'hard:dsh-config') && (isReadOnlyPathTool || (target.kind !== 'path' && !WRITE_COMMAND_PATTERN.test(target.text)))) continue
+      const textFor = rule.surface === true ? surface : target.text
+      if (rule.test.test(textFor)) {
         return { decision: 'deny', risk: RISK.HARD, rule: rule.id, note: rule.note }
       }
     }
   }
 
-  // 2) 工作区内结构放行（仅路径类工具）
+  // 1.5) 命令类「写命令」命中受保护目标（.dsh / git 元数据 / 凭据）→ 硬边界。
+  //      此前 PROTECTED_TARGETS 只对路径类工具生效，命令类可绕过（2026-09-09 实测
+  //      `New-Item ...\.dsh\...` 成功写入）。
+  if (target.kind === 'command' && WRITE_COMMAND_PATTERN.test(target.text) && PROTECTED_TARGETS.some((pattern) => pattern.test(target.text))) {
+    return { decision: 'deny', risk: RISK.HARD, rule: 'hard:protected-target', note: '受保护目标（配置/凭据/git 元数据）' }
+  }
+
+  // 2) HIGH —— 高风险，按 riskPolicies.high 分派；递归删除对工作区内路径豁免
+  if (target.kind === 'command' && surface !== '') {
+    for (const rule of HIGH_RISK_RULES) {
+      if (rule.test.test(surface)) {
+        if (isWorkspaceDelete(target.text, workspace)) {
+          return { decision: 'allow', risk: RISK.LOW, rule: rule.id, note: '工作区内递归/批量删除豁免' }
+        }
+        return { decision: 'ask', risk: RISK.HIGH, rule: rule.id, note: rule.note }
+      }
+    }
+  }
+
+  // 3) 工作区内结构放行（仅路径类工具）
   if (target.kind === 'path' && target.text !== '') {
     const resolved = resolveTarget(target.text, workspace)
     if (isProtected(resolved, toolName)) {
@@ -103,7 +161,7 @@ export function classifyByRules({ toolName, args, workspace }) {
     }
   }
 
-  // 3) ALLOW 规则
+  // 4) ALLOW 规则
   if (target.text !== '') {
     for (const rule of ALLOW_RULES) {
       if (rule.test.test(target.text)) {
@@ -112,18 +170,20 @@ export function classifyByRules({ toolName, args, workspace }) {
     }
   }
 
-  // 4) 未命中
+  // 5) 未命中
   return null
 }
 
 /**
- * 三档风险策略：低 / 中 / 高 各自可配（放行 / 拒绝 / 转人工）。
- * 极高风险（`hard`）不在此表内——它固定拒绝，任何策略都不能推翻。
+ * 三档风险策略 + 极高风险：低 / 中 / 高 / 硬 各自可配。
+ *  - low / medium / high：allow（放行）/ deny（拒绝）/ ask（转人工）；
+ *  - hard（极高风险）：只允许 deny / ask（ask = 双重人工确认，见 index.js），
+ *    配置为 allow 一律按最保守的 deny 处理（fail-closed）。
  *
- * 默认值刻意保守：低风险放行、中风险与高风险拒绝。
- * @type {Readonly<{low: string, medium: string, high: string}>}
+ * 默认值刻意保守：低风险放行、中风险与高风险拒绝、极高风险拒绝。
+ * @type {Readonly<{low: string, medium: string, high: string, hard: string}>}
  */
-export const DEFAULT_RISK_POLICIES = Object.freeze({ low: 'allow', medium: 'deny', high: 'deny' })
+export const DEFAULT_RISK_POLICIES = Object.freeze({ low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' })
 
 /** 归一化一条策略值（未知值一律按最保守的拒绝处理）。 */
 function normalizePolicy(value) {
@@ -133,13 +193,20 @@ function normalizePolicy(value) {
 /**
  * 按风险级别应用策略。
  * @param {'low' | 'medium' | 'high' | 'hard'} level - 风险级别。
- * @param {{low?: string, medium?: string, high?: string}} policies - 三档策略。
+ * @param {{low?: string, medium?: string, high?: string, hard?: string}} policies - 策略表。
  * @param {string} rule - 触发该策略的规则标签（写审计）。
  * @returns {{decision: 'deny' | 'allow' | 'ask', risk: string, rule: string, note?: string}} 裁决。
  */
 export function applyRiskPolicy(level, policies, rule = 'risk-policy') {
   if (level === 'hard') {
-    return { decision: 'deny', risk: 'hard', rule: 'hard-boundary', note: '极高风险固定拒绝（人工也不能批准）' }
+    // 极高风险不接受 allow；只有显式配置 ask 才转人工（双重确认），其余一律拒绝。
+    const decision = policies?.hard === 'ask' ? 'ask' : 'deny'
+    return {
+      decision,
+      risk: 'hard',
+      rule: decision === 'ask' ? `${rule}:hard:ask` : 'hard-boundary',
+      note: decision === 'ask' ? '极高风险需双重人工确认' : '极高风险固定拒绝（人工也不能批准）',
+    }
   }
   const policy = normalizePolicy(policies?.[level])
   const decision = policy === 'allow' ? 'allow' : policy === 'ask' ? 'ask' : 'deny'

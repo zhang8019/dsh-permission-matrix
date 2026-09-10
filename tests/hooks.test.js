@@ -50,7 +50,8 @@ function makeConfig(overrides = {}) {
   return {
     enabled: true,
     takeover: { 'fa-auto': 'auto-allow', 'ww-classify': 'classify', 'fa-classify': 'classify' },
-    riskPolicies: { low: 'allow', medium: 'deny', high: 'deny' },
+    riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' },
+    hardConfirmWindowMs: 120000,
     llmJudge: false,
     judgeProvider: '',
     judgeModel: '',
@@ -186,4 +187,122 @@ test('总开关关闭：不注册任何钩子', () => {
   const { ctx, handlers } = makeFakeCtx()
   apply(ctx, makeConfig({ enabled: false }))
   assert.equal(handlers.size, 0)
+})
+
+// ── 下一版本修复：极高风险双重人工确认 / 高风险档 ask ───────────────────────
+
+test('Config：riskPolicies.hard 默认 deny，可配置 ask', () => {
+  const parsed = Config({})
+  assert.equal(parsed.riskPolicies.hard, 'deny')
+  assert.equal(parsed.hardConfirmWindowMs, 120000)
+})
+
+test('极高风险双重确认（classify 档 hard=ask）：第1次同意→拒绝，相同调用第2次放行', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  const first = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(first.kind, 'ask')
+  assert.match(first.reason, /双重人工确认/, 'reason 必须说明双重确认流程')
+  assert.match(first.reason, /^\[pm\]/, 'reason 必须带防回环标记')
+
+  const approved = await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: first.reason }, () => Promise.resolve('allowed-once'))
+  assert.equal(approved, 'rejected', '第1次人工同意只登记，本次调用仍被拒绝')
+
+  const second = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c2' }, allowNext)
+  assert.equal(second.kind, 'allow', '窗口内相同指纹的第2次调用直接放行')
+})
+
+test('极高风险双重确认：第1次被用户拒绝则不记录，后续仍走第1次', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  const first = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: first.reason }, () => Promise.resolve('rejected'))
+
+  const retry = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c2' }, allowNext)
+  assert.equal(retry.kind, 'ask', '用户拒绝后不记录确认，需重新走第1次')
+})
+
+test('极高风险双重确认：不同命令不共享确认，窗口过期需重新确认', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, hardConfirmWindowMs: 0, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  const first = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(first.kind, 'ask')
+  await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: first.reason }, () => Promise.resolve('allowed-once'))
+
+  const different = await pre({ name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force C:\\' }, agent: { session }, callId: 'c2' }, allowNext)
+  assert.equal(different.kind, 'ask', '不同命令（不同 HARD 盘根删除）指纹不命中，需重新第1次')
+
+  const again = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c3' }, allowNext)
+  assert.equal(again.kind, 'ask', '窗口过期（0ms）后需重新双重确认')
+})
+
+test('自动同意档 + hard=ask：极高风险也走双重确认', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'fa-auto' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' } }))
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  const first = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(first.kind, 'ask', 'hard=ask 时自动同意档不再直接拒绝')
+
+  const approved = await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: first.reason }, () => Promise.resolve('allowed-once'))
+  assert.equal(approved, 'rejected')
+
+  const second = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c2' }, allowNext)
+  assert.equal(second.kind, 'allow')
+})
+
+test('自动同意档 + hard=deny：极高风险保持直接拒绝（现状不变）', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'fa-auto' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' } }))
+  const pre = handlers.get('tools/pre-execute')
+  const session = sessionOf('s1')
+  const denied = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(denied.kind, 'deny')
+})
+
+test('高风险档=ask（classify）：非盘根递归删除转人工，一次同意放行', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'ask', hard: 'deny' }, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  const first = await pre({ name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force C:\\Users\\Public\\testfolder' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(first.kind, 'ask')
+  assert.match(first.reason, /需人工确认/)
+
+  const approved = await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: first.reason }, () => Promise.resolve('allowed-once'))
+  assert.equal(approved, 'allowed-once', '高风险一次人工同意即可放行（不要求两次）')
+})
+
+test('高风险档=deny（classify）：非盘根递归删除被拒绝', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' }, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const session = sessionOf('s1')
+  const result = await pre({ name: 'pwsh', arguments: { command: 'rm -rf ~/Downloads/testfolder' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(result.kind, 'deny')
+})
+
+test('工作区内递归删除豁免：不弹窗直接放行（即使 high=ask）', async () => {
+  const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' })
+  apply(ctx, makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'ask', hard: 'deny' }, llmJudge: false }))
+  const pre = handlers.get('tools/pre-execute')
+  const session = sessionOf('s1')
+  const result = await pre({ name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force C:\\work\\proj\\dist' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(result.kind, 'allow')
 })

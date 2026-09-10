@@ -44,14 +44,19 @@ export const Config = Schema.object({
    */
   takeover: Schema.dict(Schema.string()).default({ ...TAKEOVER_DEFAULT }),
   /**
-   * 三档风险策略：低 / 中 / 高 各自可选「放行 / 拒绝 / 转人工」。
-   * 极高风险（硬拒绝清单）不在此表内，固定拒绝且人工也不能批准。
+   * 三档风险策略 + 极高风险档：
+   *  - low / medium / high 各自可选「放行 / 拒绝 / 转人工」；
+   *  - hard（极高风险）只允许「拒绝 / 转人工」——配置为 ask 时走双重人工确认
+   *    （同一操作须人工同意两次：第 1 次同意记录后返回拒绝，第 2 次相同调用才放行）。
    */
   riskPolicies: Schema.object({
     low: Schema.union(['allow', 'deny', 'ask']).default('allow'),
     medium: Schema.union(['allow', 'deny', 'ask']).default('deny'),
     high: Schema.union(['allow', 'deny', 'ask']).default('deny'),
-  }).default({ low: 'allow', medium: 'deny', high: 'deny' }),
+    hard: Schema.union(['deny', 'ask']).default('deny'),
+  }).default({ low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' }),
+  /** 极高风险双重确认的窗口（毫秒）：第 1 次人工同意后，在此窗口内相同调用第 2 次放行。 */
+  hardConfirmWindowMs: Schema.number().default(120000),
   /** LLM 裁判开关。 */
   llmJudge: Schema.boolean().default(true),
   /** LLM 裁判模型（留空 = 跟随当前会话模型）。 */
@@ -128,6 +133,51 @@ export function apply(ctx, config) {
     return true
   }
 
+  // ── 极高风险「双重人工确认」状态机（riskPolicies.hard = 'ask' 时启用） ─────
+  // 语义：同一操作须人工同意两次。第 1 次同意（approval/request 下游 allowed-once）
+  // 只记录指纹并返回 rejected（本次不执行）；窗口内相同指纹的第 2 次调用直接放行。
+  const hardAskRegs = new WeakMap() // session → Map<callId, {fingerprint, toolName}>
+  const hardConfirmed = new Map() // sessionId → [{fingerprint, toolName, at}]
+  const fingerprintOf = (exec) => `${exec.name}::${projectTarget(exec.name, exec.arguments).text.toLowerCase()}`
+  const registerHardAsk = (session, callId, info) => {
+    if (session === undefined || callId === undefined) return
+    let map = hardAskRegs.get(session)
+    if (map === undefined) {
+      map = new Map()
+      hardAskRegs.set(session, map)
+    }
+    map.set(callId, info)
+  }
+  const takeHardAsk = (session, callId) => {
+    if (session === undefined) return null
+    const map = hardAskRegs.get(session)
+    if (map === undefined || callId === undefined) return null
+    const info = map.get(callId)
+    if (info === undefined) return null
+    map.delete(callId)
+    return info
+  }
+  const recordHardConfirm = (session, { fingerprint, toolName }) => {
+    const key = String(session?.id ?? '')
+    if (key === '') return
+    const list = hardConfirmed.get(key) ?? []
+    list.push({ fingerprint, toolName, at: Date.now() })
+    hardConfirmed.set(key, list)
+  }
+  const takeHardConfirm = (session, fingerprint) => {
+    const key = String(session?.id ?? '')
+    if (key === '') return false
+    const list = hardConfirmed.get(key)
+    if (list === undefined || list.length === 0) return false
+    const windowMs = Math.max(0, Number(getConfig().hardConfirmWindowMs) || 0)
+    const now = Date.now()
+    const idx = list.findIndex((entry) => entry.fingerprint === fingerprint && now - entry.at < windowMs)
+    if (idx === -1) return false
+    list.splice(idx, 1)
+    if (list.length === 0) hardConfirmed.delete(key)
+    return true
+  }
+
   /**
    * 规则层裁决（HARD → 区内放行 → ALLOW → null）。
    * @param {object} exec - 工具执行。
@@ -154,7 +204,7 @@ export function apply(ctx, config) {
   const describe = (verdict) => `${verdict.rule}${verdict.note === undefined ? '' : `（${verdict.note}）`}`
 
   /**
-   * 完整裁决：硬拒绝 → 低风险规则 → LLM 裁判 → 三档风险策略。
+   * 完整裁决：硬拒绝 → 高风险规则 → 低风险规则 → LLM 裁判 → 三档风险策略。
    * @param {object} exec - 工具执行。
    * @param {{presetId: string, tier: string}} route - 路由。
    * @returns {Promise<object>} 裁决（含 source）。
@@ -163,9 +213,11 @@ export function apply(ctx, config) {
     const policies = getConfig().riskPolicies
     const byRule = ruleVerdictOf(exec)
     if (byRule !== null) {
-      // 极高风险：固定拒绝，不受任何策略影响
-      if (byRule.risk === 'hard') return { ...byRule, source: 'rule' }
-      // 允许规则命中 / 工作区内结构放行 → 低风险，按低风险策略
+      // 极高风险：默认拒绝；配置 ask 时转人工（双重确认在下方 ask 分支处理）
+      if (byRule.risk === 'hard') return { ...applyRiskPolicy('hard', policies, byRule.rule), source: 'rule', note: byRule.note }
+      // 高风险规则命中（非盘根递归删除 / git push）：按 riskPolicies.high 分派
+      if (byRule.risk === 'high') return { ...applyRiskPolicy('high', policies, byRule.rule), source: 'rule', note: byRule.note }
+      // 允许规则命中 / 工作区内结构放行 / 工作区内递归删除豁免 → 低风险
       return { ...applyRiskPolicy('low', policies, byRule.rule), source: 'rule', note: byRule.note }
     }
 
@@ -192,7 +244,10 @@ export function apply(ctx, config) {
           // 自动同意档：只保留硬拒绝保护，其余一律放行
           const byRule = ruleVerdictOf(exec)
           if (byRule === null || byRule.decision === 'allow') return next()
-          effective = { ...byRule, source: 'rule' }
+          // hard 配置 ask 时，自动同意档也走双重人工确认
+          effective = byRule.risk === 'hard' && getConfig().riskPolicies.hard === 'ask'
+            ? { ...applyRiskPolicy('hard', getConfig().riskPolicies, byRule.rule), source: 'rule', note: byRule.note }
+            : { ...byRule, source: 'rule' }
         } else {
           effective = await decide(exec, route)
         }
@@ -217,7 +272,24 @@ export function apply(ctx, config) {
         }
 
         if (effective.decision === 'ask') {
+          // 极高风险双重确认：窗口内相同指纹的第 2 次调用直接放行
+          if (effective.risk === 'hard' && takeHardConfirm(session, fingerprintOf(exec))) {
+            audit.write({
+              sessionId: session?.id ?? null,
+              preset: route.presetId,
+              tool: exec.name,
+              target: projectTarget(exec.name, exec.arguments).text.slice(0, 500),
+              risk: effective.risk,
+              rule: effective.rule,
+              source: effective.source,
+              decision: 'allow',
+              outcome: 'hard-confirm-2',
+            })
+            ctx.logger.info(`permission-matrix: allow ${exec.name} (${effective.rule}, double-confirmed) preset=${route.presetId}`)
+            return next()
+          }
           markPending(session, exec.callId)
+          if (effective.risk === 'hard') registerHardAsk(session, exec.callId, { fingerprint: fingerprintOf(exec), toolName: exec.name })
           audit.write({
             sessionId: session?.id ?? null,
             preset: route.presetId,
@@ -227,10 +299,13 @@ export function apply(ctx, config) {
             rule: effective.rule,
             source: effective.source,
             decision: 'ask',
-            outcome: 'escalated-to-human',
+            outcome: effective.risk === 'hard' ? 'hard-ask-1' : 'escalated-to-human',
           })
           ctx.logger.info(`permission-matrix: ask ${exec.name} (${effective.rule}, ${effective.source}) preset=${route.presetId}`)
-          return { kind: 'ask', reason: `${HUMAN_TAG} 需人工确认：${exec.name}（${describe(effective)}）` }
+          const hint = effective.risk === 'hard'
+            ? '极高风险操作需双重人工确认：第 1 次同意仅登记，本调用仍将被拒绝，请再次发起相同操作完成第 2 次确认后才会执行。'
+            : '需人工确认'
+          return { kind: 'ask', reason: `${HUMAN_TAG} ${hint}：${exec.name}（${describe(effective)}）` }
         }
 
         audit.write({
@@ -264,7 +339,27 @@ export function apply(ctx, config) {
       if (route === null) return next()
 
       // 防回环：本插件自己发起的转人工请求，交给浏览器/其他应答者
-      if (takePending(session, req.callId) || String(req.reason ?? '').startsWith(HUMAN_TAG)) return next()
+      if (takePending(session, req.callId) || String(req.reason ?? '').startsWith(HUMAN_TAG)) {
+        const firstAsk = takeHardAsk(session, req.callId)
+        const downstream = await next()
+        // 极高风险双重确认：下游（用户）第 1 次同意 → 只记录指纹，本次仍拒绝执行，
+        // 等窗口内相同调用第 2 次放行（pre-execute 的 takeHardConfirm 分支）。
+        if (firstAsk !== null && downstream === 'allowed-once') {
+          recordHardConfirm(session, firstAsk)
+          audit.write({
+            sessionId: session?.id ?? null,
+            preset: route.presetId,
+            tool: req.toolName,
+            risk: 'hard',
+            rule: 'hard:double-confirm',
+            decision: 'ask',
+            outcome: 'hard-confirm-1',
+          })
+          ctx.logger.info(`permission-matrix: double-confirm recorded for ${req.toolName} (${firstAsk.toolName}); ${firstAsk.fingerprint}`)
+          return 'rejected'
+        }
+        return downstream
+      }
 
       try {
         const textVerdict = ruleVerdictOfText(req.reason)

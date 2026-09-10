@@ -29,6 +29,12 @@ window.__ModuleLoader__.load({
 			{ value: 'ask', label: '转人工' },
 		]
 
+		/** 极高风险档专用选项：只允许拒绝 / 转人工双重核对（不允许放行）。 */
+		var HARD_POLICY_OPTIONS = [
+			{ value: 'deny', label: '拒绝' },
+			{ value: 'ask', label: '转人工（双重核对）' },
+		]
+
 		var box = { border: '0.5px solid var(--dsw-alias-border-l2)', borderRadius: '12px', padding: '14px 16px', marginBottom: '12px', background: 'var(--dsw-alias-bg-layer-1)' }
 		var h2 = { fontSize: '14px', fontWeight: 600, margin: '0 0 4px' }
 		var desc = { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', margin: '0 0 10px' }
@@ -199,8 +205,11 @@ window.__ModuleLoader__.load({
 			var policyOptions = POLICY_OPTIONS.map(function (o) {
 				return react.createElement('option', { key: o.value, value: o.value }, o.label)
 			})
+			var hardOptions = HARD_POLICY_OPTIONS.map(function (o) {
+				return react.createElement('option', { key: o.value, value: o.value }, o.label)
+			})
 			var riskPolicies = effective.riskPolicies || {}
-			var riskRow = function (levelKey, title, hint) {
+			var riskRow = function (levelKey, title, hint, options) {
 				return react.createElement('div', { key: 'rp-' + levelKey, style: row }, [
 					react.createElement('span', { key: 'l', style: label }, title),
 					react.createElement('select', {
@@ -212,16 +221,17 @@ window.__ModuleLoader__.load({
 							next[levelKey] = e.target.value
 							set('riskPolicies', next)
 						},
-					}, policyOptions),
+					}, options || policyOptions),
 					react.createElement('span', { key: 'h', style: desc }, hint),
 				])
 			}
 			children.push(react.createElement('div', { key: 'risk', style: box }, [
-				react.createElement('h2', { key: 'h', style: h2 }, '自动风险审批 · 三档策略'),
-				react.createElement('p', { key: 'p', style: desc }, '低 / 中 / 高 三档风险各自可选「放行 / 拒绝 / 转人工」。极高风险（下面的硬拒绝清单）固定拒绝，人工也不能批准，不受任何策略影响。'),
+				react.createElement('h2', { key: 'h', style: h2 }, '自动风险审批 · 四档策略'),
+				react.createElement('p', { key: 'p', style: desc }, '低 / 中 / 高 三档各自可选「放行 / 拒绝 / 转人工」。极高风险（下面的硬拒绝清单）只允许「拒绝」或「转人工（双重核对）」——选转人工后，同一极高风险操作须人工同意两次：第 1 次同意仅登记并拒绝本次执行，窗口内第 2 次相同调用才放行。'),
 				riskRow('low', '低风险策略', '允许规则命中、工作区内操作、裁判判定安全 → 默认放行'),
 				riskRow('medium', '中风险策略', '规则未命中、裁判不确定 → 默认拒绝'),
-				riskRow('high', '高风险策略', '裁判判定危险 → 默认拒绝'),
+				riskRow('high', '高风险策略', '裁判判定危险、非盘根递归删除、git push → 默认拒绝'),
+				riskRow('hard', '极高风险策略', '删根 / 格式化 / 提权 / 凭据 / 系统级包安装等 → 默认拒绝；转人工 = 双重核对', hardOptions),
 				react.createElement('div', { key: 'r2', style: row }, [
 					react.createElement('label', { key: 'l', style: Object.assign({}, label, { display: 'flex', gap: '6px', alignItems: 'center' }) }, [
 						react.createElement('input', {
