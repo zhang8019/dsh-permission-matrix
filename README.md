@@ -47,7 +47,7 @@
 
 ## 风险分级与判定顺序
 
-1. **硬拒绝(HARD)** → 默认直接拒绝,**人工也不能批准**(`riskPolicies.hard = 'deny'`);配为 `ask` 时改为**双重人工确认**(见下节),但**不提供「放行」选项**;
+1. **硬拒绝(HARD)** → 默认直接拒绝,**人工也不能批准**(`riskPolicies.hard = 'deny'`);配为 `ask` 时改为**批准密码**通道(见下节),但**不提供「放行」选项**;
 2. **高风险(HIGH)** → 按 `riskPolicies.high` 分派;非盘根递归/批量删除、普通 `git push` 走此档,**工作区内路径豁免**;
 3. **工作区内结构放行**(write/edit/read 且目标在会话工作区内)→ 放行(受保护目标除外:`~/.dsh`、凭据、`.git/config|hooks`);只读工具读取系统目录/配置同样放行——**读不是写**;
 4. **允许规则**(常规 git、包管理器查询、语言运行时、PowerShell cmdlet 等)→ 放行;
@@ -69,15 +69,22 @@ HARD/HIGH 规则**只匹配真正会被执行的片段**:`executionSurface()` �
 
 同理,只读形态与写入形态被区分开:`schtasks /query`、`net user`(列用户)、`icacls <路径>`(查 ACL)、`bcdedit /enum`、`diskpart /?` 等只读查询与帮助文本放行,对应的写/变更形态仍然拒绝。
 
-### 极高风险「双重人工确认」
+### 极高风险「批准密码」
 
-`riskPolicies.hard = 'ask'` 时,同一操作须**人工同意两次**才会执行:
+`riskPolicies.hard = 'ask'` 时,极高风险操作**必须凭批准密码放行**——无论点多少次审批弹窗都不会放行:
 
-1. 第 1 次:弹人工确认;用户同意后插件**只登记指纹**(工具名 + 投影目标)并**拒绝本次执行**;
-2. 第 2 次:窗口(`hardConfirmWindowMs`,默认 120 秒)内**相同指纹**的调用直接放行,不再弹窗;
-3. 用户第 1 次拒绝、窗口过期或指纹不同 → 不登记,下次重新从第 1 次开始。
+1. 操作被拦截(审计 `outcome=hard-password-required`),同时登记一条**待批准请求**(工具名 + 投影目标 + 指纹);
+2. 打开 **设置 → 权限矩阵 → 极高风险批准密码**,输入批准密码:
+   - **批准该请求** → 签发绑定该指纹的令牌(只放行那一个操作);
+   - **授权下一次极高风险操作** → 签发通配令牌(放行下一次任意极高风险操作);
+   - 也可直接用浏览器打开 `<Web 地址>/dsh-permission-matrix/approve`(纯表单页,无需前端脚本);
+3. 令牌在 `hardApprovalTtlMs`(默认 300 秒)内有效、**只放行一次**,用后即焚;
+4. 让模型重新执行该操作即可放行;令牌过期、指纹不同或会话不同都不放行。
 
-> 默认仍为 `deny`(直接拒绝)。设置页对极高风险档只提供「拒绝」与「转人工(双重核对)」两个选项,配置 `allow` 会在加载期 fail-closed 拒绝。
+> 默认仍为 `deny`(直接拒绝)。设置页对极高风险档只提供「拒绝」与「转人工(需批准密码)」两个选项,配置 `allow` 会在加载期 fail-closed 拒绝。
+> **未设置批准密码 ⇒ 极高风险一律拒绝**,不存在任何绕过路径(该分支是 fail-closed 的)。
+
+**密码学**:口令以 **scrypt**(N=16384, r=8, p=1, 随机盐)哈希写入 settings 文档,明文既不落盘也**不回传浏览器**(`/status` 只回一个 `hardApprovalPasswordSet` 布尔);`hardApprovalPasswordHash` 不在设置页的可写键白名单里,只能经专用动作路由写入。待批准请求与令牌都在内存中,DSH 重启即失效。
 
 **硬拒绝清单在设置页只读**,不可编辑——防止通过配置绕过硬边界。
 
@@ -122,7 +129,8 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 | `enabled` | `true` | 总开关 |
 | `takeover` | 见上表 | 预设 id → 审批档(`auto-allow` / `classify`) |
 | `riskPolicies` | `{low:allow, medium:deny, high:deny, hard:deny}` | 四档风险策略;极高风险只接受 `deny` / `ask` |
-| `hardConfirmWindowMs` | `120000` | 极高风险双重确认的窗口(毫秒) |
+| `hardApprovalPasswordHash` | 空 | 极高风险批准密码的 scrypt 哈希(设置页写入,明文不落盘;**不在**可写白名单,仅专用路由可写) |
+| `hardApprovalTtlMs` | `300000` | 批准令牌有效期(毫秒):密码批准后放行一次 |
 | `llmJudge` | `true` | LLM 裁判开关 |
 | `judgeProvider` / `judgeModel` | 空 | 留空 = 跟随当前会话模型 |
 | `judgeStages` | `both` | `both` / `fast` / `thinking` |
@@ -144,7 +152,7 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 {"time":"2026-09-09T10:52:00.000Z","sessionId":"…","preset":"ww-classify","tool":"write","target":"D:\\out\\a.txt","risk":"medium","rule":"mid-policy:deny","source":"mid","decision":"deny","outcome":"blocked"}
 ```
 
-`outcome` 取值含 `passed` / `blocked` / `allowed-once` / `escalated-to-human` / `hard-ask-1` / `hard-confirm-2`(极高风险双重确认的两个阶段)。
+`outcome` 取值含 `passed` / `blocked` / `allowed-once` / `escalated-to-human` / `hard-password-required`(极高风险被拦、等待批准密码) / `hard-password-approved`(凭批准密码放行)。
 
 只写文件与进程日志,**不进入模型 transcript**。
 
@@ -152,26 +160,27 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 
 ```
 src/
-├── index.js           装配 + 三个钩子(tools/pre-execute、approval/request、session/created)+ 双重确认状态机
+├── index.js           装配 + 三个钩子(tools/pre-execute、approval/request、session/created)+ 极高风险批准密码闸门
 ├── presets.js         9 预设的单一真源
 ├── preset-router.js   当前会话预设 → 是否接管、以哪档接管
 ├── decide.js          决策核心(纯函数:HARD → HIGH → 区内放行 → 允许规则 → null)
 ├── rules.js           硬拒绝 / 高风险 / 允许规则表 + 执行面提取 + 字段投影
+├── hard-approval.js   极高风险批准密码(scrypt 哈希 + 待批准请求 + 一次性令牌)
 ├── judge.js           LLM 裁判(两阶段 + 跟随会话模型 + 失败降级)
 ├── snapshot.js        Git 快照
 ├── audit.js           JSONL 审计
 ├── robot-presets.js   机器人工作区 → 默认预设
-├── settings.js        settings 命名空间 + webServer 同源路由
+├── settings.js        settings 命名空间 + webServer 同源路由(含批准页)
 └── client/index.js    设置页(手写 __ModuleLoader__ bundle)
 ```
 
 ## 测试
 
 ```sh
-node --test tests/decide.test.js tests/hooks.test.js
+node --test tests/decide.test.js tests/hard-approval.test.js tests/hooks.test.js
 ```
 
-51 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push`)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略、极高风险双重确认状态机、fail-closed 校验、防回环、机器人预设切换、总开关。
+60 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push`)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略、**极高风险批准密码(哈希校验 / 一次性令牌 / 指纹与会话绑定 / TTL / fail-closed / 端到端拦截→设密码→批准→放行)**、fail-closed 校验、防回环、机器人预设切换、总开关。
 
 ## 实测与修复记录(v0.2.0,2026-09-10)
 
@@ -202,6 +211,18 @@ node --test tests/decide.test.js tests/hooks.test.js
 - 沙箱升级通道放开后,规则漏洞仍可穿透执行——因此漏拦截修复在 ww 模式同样必要;
 - v0.2.0 验证:单元测试 51 条全过;仓库 `src/` 与已安装 profile 的 `src/` SHA256 逐一一致(实机生效)。
 
+## v0.3.0(2026-09-10):双重确认 → 批准密码
+
+**失效根因(实测 + 审计证据)**:v0.2 的「极高风险双重人工确认」要求"模型在窗口内**原样重发同一条命令**"才能完成第 2 次放行。实际行为是:
+
+- 第 1 次调用被拒后**模型不会原样重发**,而是改写命令(加 `Write-Host`、换变量、换工具)或改走别的路径 → 指纹(工具名 + 投影目标)随之变化,`hard-confirm-2` 分支永不命中;
+- 审计日志 `~/.dsh/permission-matrix/audit.jsonl` 1064 条记录里 `hard-confirm-1` 出现 3 次、**`hard-confirm-2` 出现 0 次**——即极高风险操作事实上**无法被人工放行**;
+- 用户实测现象一致:只弹一次窗,第 1 次批准被立刻当成拒绝,之后不再有第 2 次。
+
+**v0.3.0 替换方案**:极高风险不再依赖模型行为,改为**批准密码**——拦截后登记待批准请求,用户在设置页(或 `/dsh-permission-matrix/approve` 批准页)输入密码才签发一次性令牌放行;没有密码就永远拒绝。设置页新增「极高风险批准密码」区块(设置 / 修改 / 清除密码、待批准请求列表、授权下一次、批准有效期)。
+
+**破坏性变更**:`hardConfirmWindowMs` 由 `hardApprovalTtlMs` 取代;极高风险 `ask` 档不再产生人工审批弹窗(改走密码闸门);审计 `outcome` 用 `hard-password-required` / `hard-password-approved` 取代 `hard-ask-1` / `hard-confirm-2`。
+
 ## 参考与致谢
 
 本插件的设计参考了以下三个社区插件(思路借鉴 + 取舍改进,**代码为独立实现**):
@@ -209,7 +230,7 @@ node --test tests/decide.test.js tests/hooks.test.js
 ### 1. [dsh-auto-classifier](https://github.com/nanmicoder/dsh-auto-classifier) — 主要参考
 
 - **借鉴**:单点 `auto` 预设的定位(低风险放行 / 危险拦截 / 沙箱升级自动裁决)、`tools/pre-execute` + `approval/request` 双钩子 + `{prepend:true}` 抢占、HARD/SOFT 风险分级、`Tool(pattern)` 规则语法、字段投影(命令类只扫 `command/code`、路径类只扫 `file_path`)、工作区内结构放行、LLM 裁判两阶段(快速过滤 + 思考复审)、拒绝日志与 denial 上限、Git 快照。
-- **改进**:把「单点 auto」升级为 **3 沙箱 × 4 审批 = 9 个可组合预设**;风险分级从 2 档细化为**低/中/高 + 极高**,且四档**各自可配**(极高档只允许拒绝 / 双重人工核对);新增执行面识别以消除"提及即拦截";新增全局默认 + LLM 机器人默认两个维度。
+- **改进**:把「单点 auto」升级为 **3 沙箱 × 4 审批 = 9 个可组合预设**;风险分级从 2 档细化为**低/中/高 + 极高**,且四档**各自可配**(极高档只允许拒绝 / 转人工(需批准密码));新增执行面识别以消除"提及即拦截";新增全局默认 + LLM 机器人默认两个维度。
 - **修正**:该插件用 `permissionPresets.current(session.events)`(旧签名),在 DSH 0.1.2-rc.1 下会被 `try/catch` 静默吞掉而失效;本插件改用正确签名 `current(session)` 并回退到投影读取。
 
 ### 2. [dsh-auto-approval-plugin](https://github.com/StyxNether/dsh-auto-approval-plugin) — 审批应答者参考

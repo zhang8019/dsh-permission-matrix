@@ -2,7 +2,7 @@
  * 决策核心：纯函数、无 I/O、可单测。
  *
  * 判定顺序（与设计说明书 §6.1 一致）：
- *   1. HARD（极高风险）→ `deny`（默认）或 `ask`（双重人工确认，见 index.js）
+ *   1. HARD（极高风险）→ `deny`（默认）或 `ask`（批准密码通道，见 index.js / hard-approval.js）
  *   2. HIGH（高风险）→ `riskPolicies.high` 策略；递归删除对工作区内路径豁免
  *   3. 工作区内结构放行（write/edit/read 且目标在会话工作区内，受保护目标除外）→ `allow`
  *   4. ALLOW 规则 → `allow`
@@ -177,7 +177,7 @@ export function classifyByRules({ toolName, args, workspace }) {
 /**
  * 三档风险策略 + 极高风险：低 / 中 / 高 / 硬 各自可配。
  *  - low / medium / high：allow（放行）/ deny（拒绝）/ ask（转人工）；
- *  - hard（极高风险）：只允许 deny / ask（ask = 双重人工确认，见 index.js），
+ *  - hard（极高风险）：只允许 deny / ask（ask = 需批准密码放行，见 index.js），
  *    配置为 allow 一律按最保守的 deny 处理（fail-closed）。
  *
  * 默认值刻意保守：低风险放行、中风险与高风险拒绝、极高风险拒绝。
@@ -199,13 +199,13 @@ function normalizePolicy(value) {
  */
 export function applyRiskPolicy(level, policies, rule = 'risk-policy') {
   if (level === 'hard') {
-    // 极高风险不接受 allow；只有显式配置 ask 才转人工（双重确认），其余一律拒绝。
+    // 极高风险不接受 allow；只有显式配置 ask 才转人工（批准密码），其余一律拒绝。
     const decision = policies?.hard === 'ask' ? 'ask' : 'deny'
     return {
       decision,
       risk: 'hard',
       rule: decision === 'ask' ? `${rule}:hard:ask` : 'hard-boundary',
-      note: decision === 'ask' ? '极高风险需双重人工确认' : '极高风险固定拒绝（人工也不能批准）',
+      note: decision === 'ask' ? '极高风险需批准密码才能放行' : '极高风险固定拒绝（人工也不能批准）',
     }
   }
   const policy = normalizePolicy(policies?.[level])

@@ -29,10 +29,10 @@ window.__ModuleLoader__.load({
 			{ value: 'ask', label: '转人工' },
 		]
 
-		/** 极高风险档专用选项：只允许拒绝 / 转人工双重核对（不允许放行）。 */
+		/** 极高风险档专用选项：只允许拒绝 / 转人工（转人工 = 需批准密码放行）。 */
 		var HARD_POLICY_OPTIONS = [
 			{ value: 'deny', label: '拒绝' },
-			{ value: 'ask', label: '转人工（双重核对）' },
+			{ value: 'ask', label: '转人工（需批准密码）' },
 		]
 
 		var box = { border: '0.5px solid var(--dsw-alias-border-l2)', borderRadius: '12px', padding: '14px 16px', marginBottom: '12px', background: 'var(--dsw-alias-bg-layer-1)' }
@@ -107,6 +107,22 @@ window.__ModuleLoader__.load({
 			var [draft, setDraft] = react.useState(null)
 			var [msg, setMsg] = react.useState(null)
 			var [showRules, setShowRules] = react.useState(true)
+			var [pwCurrent, setPwCurrent] = react.useState('')
+			var [pwNew, setPwNew] = react.useState('')
+			var [pwConfirm, setPwConfirm] = react.useState('')
+			var [approvePw, setApprovePw] = react.useState('')
+			var [hardMsg, setHardMsg] = react.useState(null)
+
+			// 批准状态轮询：极高风险被拦截时，本页无需手动刷新就会出现「待批准请求」。
+			react.useEffect(function () {
+				var timer = setInterval(function () {
+					fetch(BASE + '/hard-approval')
+						.then(function (r) { return r.json() })
+						.then(function (res) { if (res && res.ok) api.patch({ hardApproval: res }) })
+						.catch(function () {})
+				}, 3000)
+				return function () { clearInterval(timer) }
+			}, [api.patch])
 
 			var effective = draft || config
 			var set = function (key, value) {
@@ -227,11 +243,11 @@ window.__ModuleLoader__.load({
 			}
 			children.push(react.createElement('div', { key: 'risk', style: box }, [
 				react.createElement('h2', { key: 'h', style: h2 }, '自动风险审批 · 四档策略'),
-				react.createElement('p', { key: 'p', style: desc }, '低 / 中 / 高 三档各自可选「放行 / 拒绝 / 转人工」。极高风险（下面的硬拒绝清单）只允许「拒绝」或「转人工（双重核对）」——选转人工后，同一极高风险操作须人工同意两次：第 1 次同意仅登记并拒绝本次执行，窗口内第 2 次相同调用才放行。'),
+				react.createElement('p', { key: 'p', style: desc }, '低 / 中 / 高 三档各自可选「放行 / 拒绝 / 转人工」。极高风险（下面的硬拒绝清单）只允许「拒绝」或「转人工（需批准密码）」——选转人工后，极高风险操作须在下面的「极高风险批准密码」区输入密码才能放行一次；未设置密码则该档等于拒绝（不存在"多点几次就过"的路径）。'),
 				riskRow('low', '低风险策略', '允许规则命中、工作区内操作、裁判判定安全 → 默认放行'),
 				riskRow('medium', '中风险策略', '规则未命中、裁判不确定 → 默认拒绝'),
 				riskRow('high', '高风险策略', '裁判判定危险、非盘根递归删除、git push → 默认拒绝'),
-				riskRow('hard', '极高风险策略', '删根 / 格式化 / 提权 / 凭据 / 系统级包安装等 → 默认拒绝；转人工 = 双重核对', hardOptions),
+				riskRow('hard', '极高风险策略', '删根 / 格式化 / 提权 / 凭据 / 系统级包安装等 → 默认拒绝；转人工 = 需批准密码', hardOptions),
 				react.createElement('div', { key: 'r2', style: row }, [
 					react.createElement('label', { key: 'l', style: Object.assign({}, label, { display: 'flex', gap: '6px', alignItems: 'center' }) }, [
 						react.createElement('input', {
@@ -331,6 +347,158 @@ window.__ModuleLoader__.load({
 							react.createElement('span', { key: 'n', style: badge }, r.note),
 							react.createElement('span', { key: 'p', style: mono }, r.pattern),
 						])
+					})),
+				]) : null,
+			]))
+
+			// ── 极高风险批准密码 ──────────────────────────────────────────
+			var hard = state.hardApproval || {}
+			var hardPending = hard.pending || []
+			var hardGrants = hard.grants || []
+			var pwSet = hard.passwordSet === true || config.hardApprovalPasswordSet === true
+
+			var hardAction = function (payload) {
+				return post('/hard-approval', payload).then(function (res) {
+					if (res && res.ok) setHardMsg({ kind: 'ok', text: res.message || '已生效' })
+					else setHardMsg({ kind: 'error', text: (res && res.error) || '操作失败' })
+					if (res && (res.ok === true || Array.isArray(res.pending))) api.patch({ hardApproval: res })
+					return res
+				})
+			}
+			var doSetPassword = function () {
+				hardAction({ action: 'set-password', currentPassword: pwCurrent, newPassword: pwNew, confirmPassword: pwConfirm }).then(function (res) {
+					if (res && res.ok) {
+						setPwCurrent('')
+						setPwNew('')
+						setPwConfirm('')
+					}
+				})
+			}
+			var doClearPassword = function () {
+				if (!pwCurrent) {
+					setHardMsg({ kind: 'error', text: '清除密码需先输入当前批准密码' })
+					return
+				}
+				hardAction({ action: 'clear-password', password: pwCurrent }).then(function (res) {
+					if (res && res.ok) setPwCurrent('')
+				})
+			}
+			var doApprove = function (requestId) {
+				if (!approvePw) {
+					setHardMsg({ kind: 'error', text: '请先输入批准密码' })
+					return
+				}
+				hardAction({ action: 'approve', requestId: requestId, password: approvePw }).then(function (res) {
+					if (res && res.ok) setApprovePw('')
+				})
+			}
+			var doAuthorizeNext = function () {
+				if (!approvePw) {
+					setHardMsg({ kind: 'error', text: '请先输入批准密码' })
+					return
+				}
+				hardAction({ action: 'authorize-next', password: approvePw }).then(function (res) {
+					if (res && res.ok) setApprovePw('')
+				})
+			}
+			var hardMsgStyle = {
+				fontSize: '12px',
+				color: hardMsg && hardMsg.kind === 'ok' ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)',
+			}
+
+			children.push(react.createElement('div', { key: 'hardpw', style: box }, [
+				react.createElement('h2', { key: 'h', style: h2 }, '极高风险批准密码'),
+				react.createElement('p', { key: 'p', style: desc },
+					'极高风险操作（删根 / 格式化 / 提权 / 凭据读取 / 系统级包安装 / DSH 配置篡改 …）在策略选「转人工」时，必须输入本密码才能放行：插件先拦截并登记一条待批准请求，你在下面（或浏览器打开 http://127.0.0.1:<Web端口>/dsh-permission-matrix/approve）输入密码批准，然后让模型重新执行即放行一次。未设置密码 ⇒ 极高风险一律拒绝。'),
+				react.createElement('div', { key: 'status', style: row }, [
+					react.createElement('span', { key: 'l', style: label }, '批准密码状态'),
+					react.createElement('span', {
+						key: 'v',
+						style: Object.assign({}, badge, { color: pwSet ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' }),
+					}, pwSet ? '已设置' : '未设置（极高风险一律拒绝）'),
+					react.createElement('span', { key: 'h', style: desc }, '口令以 scrypt 哈希存储：明文不落盘、不回传页面'),
+				]),
+				react.createElement('div', { key: 'setpw', style: row }, [
+					pwSet ? react.createElement('input', {
+						key: 'c',
+						style: Object.assign({}, input, { minWidth: '150px' }),
+						type: 'password',
+						placeholder: '当前批准密码',
+						value: pwCurrent,
+						autoComplete: 'off',
+						onChange: function (e) { setPwCurrent(e.target.value) },
+					}) : null,
+					react.createElement('input', {
+						key: 'n',
+						style: Object.assign({}, input, { minWidth: '150px' }),
+						type: 'password',
+						placeholder: '新批准密码（≥6 位）',
+						value: pwNew,
+						autoComplete: 'new-password',
+						onChange: function (e) { setPwNew(e.target.value) },
+					}),
+					react.createElement('input', {
+						key: 'n2',
+						style: Object.assign({}, input, { minWidth: '150px' }),
+						type: 'password',
+						placeholder: '再输一次',
+						value: pwConfirm,
+						autoComplete: 'new-password',
+						onChange: function (e) { setPwConfirm(e.target.value) },
+					}),
+					react.createElement('button', { key: 'b', style: btn, onClick: doSetPassword }, pwSet ? '修改密码' : '设置密码'),
+					pwSet ? react.createElement('button', { key: 'b2', style: btn, onClick: doClearPassword }, '清除密码') : null,
+				]),
+				react.createElement('div', { key: 'ttl', style: row }, [
+					react.createElement('span', { key: 'l', style: label }, '批准有效期'),
+					react.createElement('input', {
+						key: 'i',
+						style: Object.assign({}, input, { minWidth: '120px' }),
+						type: 'number',
+						value: effective.hardApprovalTtlMs || 300000,
+						onChange: function (e) { set('hardApprovalTtlMs', Number(e.target.value) || 300000) },
+					}),
+					react.createElement('span', { key: 'h', style: desc }, '毫秒；批准后在此窗口内放行一次（用后即焚）'),
+					react.createElement('button', { key: 'b', style: btn, onClick: save, disabled: !draft }, '保存有效期'),
+				]),
+				hardMsg ? react.createElement('p', { key: 'hm', style: hardMsgStyle }, hardMsg.text) : null,
+				react.createElement('div', { key: 'pend', style: { marginTop: '10px' } }, [
+					react.createElement('div', { key: 'h', style: Object.assign({}, h2, { fontSize: '13px' }) }, '待批准的极高风险请求（' + hardPending.length + '）'),
+					hardPending.length === 0
+						? react.createElement('p', { key: 'e', style: desc }, '暂无。极高风险操作被拦截后会自动出现在这里（每 3 秒刷新）。')
+						: react.createElement('div', { key: 'rows' }, hardPending.map(function (item) {
+							return react.createElement('div', {
+								key: item.id,
+								style: { border: '0.5px solid var(--dsw-alias-border-l2)', borderRadius: '8px', padding: '8px 10px', margin: '6px 0' },
+							}, [
+								react.createElement('div', { key: 'a', style: { fontSize: '12px' } }, [
+									react.createElement('span', { key: 'b', style: badge }, item.toolName),
+									react.createElement('span', { key: 't', style: desc }, item.at),
+									react.createElement('span', { key: 'i', style: Object.assign({}, desc, { fontFamily: 'monospace' }) }, item.id),
+								]),
+								react.createElement('div', { key: 't2', style: mono }, item.target || '（无目标文本）'),
+								react.createElement('button', { key: 'b2', style: btn, onClick: function () { doApprove(item.id) } }, '批准（放行一次）'),
+							])
+						})),
+				]),
+				react.createElement('div', { key: 'appr', style: row }, [
+					react.createElement('input', {
+						key: 'p',
+						style: Object.assign({}, input, { minWidth: '150px' }),
+						type: 'password',
+						placeholder: '批准密码',
+						value: approvePw,
+						autoComplete: 'off',
+						onChange: function (e) { setApprovePw(e.target.value) },
+					}),
+					react.createElement('button', { key: 'b', style: btn, onClick: doAuthorizeNext }, '授权下一次极高风险操作'),
+					react.createElement('span', { key: 'h', style: desc }, '不绑定具体操作：下一次极高风险操作放行一次'),
+				]),
+				hardGrants.length > 0 ? react.createElement('div', { key: 'g', style: { marginTop: '8px' } }, [
+					react.createElement('div', { key: 'h', style: Object.assign({}, h2, { fontSize: '13px' }) }, '生效中的批准（' + hardGrants.length + '）'),
+					react.createElement('div', { key: 'l' }, hardGrants.map(function (grant) {
+						return react.createElement('div', { key: grant.id, style: { fontSize: '12px' } },
+							(grant.toolName || '任意极高风险操作') + ' — 剩余 ' + Math.round((grant.expiresInMs || 0) / 1000) + ' 秒（' + grant.id + '）')
 					})),
 				]) : null,
 			]))
