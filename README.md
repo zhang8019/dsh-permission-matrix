@@ -185,7 +185,7 @@ src/
 node --test tests/decide.test.js tests/password-approval.test.js tests/hooks.test.js
 ```
 
-66 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push`)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略(含 `password` 值)、**密码批准(哈希校验 / 挂起与超时 / dismiss 与 abort / 一次性令牌 / 指纹与会话绑定 / fail-closed / 「弹窗输密码 → 挂起调用立即放行」端到端 / 中风险档同样生效)**、fail-closed 校验、防回环、机器人预设切换、总开关。
+69 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push` / 动态执行变量)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、**拼接执行绕过(拆片段 / `iex` 动态执行 → 硬拒绝;纯输出文案不误伤)**、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略(含 `password` 值)、**密码批准(哈希校验 / 挂起与超时 / dismiss 与 abort / 一次性令牌 / 指纹与会话绑定 / fail-closed / 「弹窗输密码 → 挂起调用立即放行」端到端 / 中风险档同样生效)**、fail-closed 校验、防回环、机器人预设切换、总开关。
 
 ## 实测与修复记录(v0.2.0,2026-09-10)
 
@@ -207,8 +207,12 @@ node --test tests/decide.test.js tests/password-approval.test.js tests/hooks.tes
 - `read` 工具读系统目录被拦(pwsh 读同一文件却放行) → 新增只读工具豁免(`READ_PATH_TOOLS`);
 - 读取 `settings.yaml` 被当"篡改"拒 → 只读形态豁免,写入仍硬拒绝。
 
-**⚠️ 已知限制(未修)**
-- **命令文本拼接绕过**(`$p1='Remove-'; $p2='Item -Recurse -Force C:\'; & $p1$p2`):动态拼接无法靠静态正则识别,依赖沙箱层与 LLM 裁判兜底。
+**✅ 拼接/动态执行绕过(2026-09-10 修复)**
+- 原`已知限制`所列的**命令文本拼接绕过**(`$p1='Remove-'; $p2='Item -Recurse -Force C:\'; & $p1$p2`)已修复:实测还有更多同族漏拦(`$c='diskpart'; & $c`、`$x='shutdown /s'; iex $x`、`$cmd='net user hacker P@ss /add'; Invoke-Expression $cmd`),一并堵上。
+- 做法:检测到**动态执行形态**(`& $var` / `. $var` / `iex $var` / `$a$b` 相邻变量)时,把**引号内的字符串**当真实命令再跑一遍 HARD 规则,并识别被拆开的 cmdlet 动词片段(`'Remove-'` 这类「动词 + 连字符结尾」,记为 `hard:concat-fragment`);
+- 关键取舍:该检查**只在出现动态执行形态时**触发,所以 `Write-Host 'rm -rf /'` 这类纯文案不会被牵连——顺带修掉了此前"`Write-Host` 里提到危险词就被判 hard"的误拦(纯输出 cmdlet 现在一律按执行面匹配);
+- 单独出现 `& $someExe --version` 这种正常动态调用**不硬拒绝**,落到高风险档 `high:dyn-call`(默认 deny,可配 `ask` / `password`);
+- 残余风险:变量经多层间接(数组/哈希表/子表达式 `$(...)` 拼接、`[scriptblock]::Create`)仍可能绕过静态分析,依赖沙箱层与 LLM 裁判兜底。
 
 **其它实测结论**
 - ✅ HARD 清单本体可靠:全部硬拒绝规则按预期触发(含大小写 / 引号 / 嵌套变体);

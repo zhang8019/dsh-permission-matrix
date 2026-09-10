@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-matrix",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Permission matrix for DeepSeek Harness: 3 sandbox modes x 4 approval strategies = 9 selectable presets, with a global default, a separate LLM-robot default, three-tier risk policies, audit log and git checkpoint.",
   "type": "module",
   "main": "./src/index.js",

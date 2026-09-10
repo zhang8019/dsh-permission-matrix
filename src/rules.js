@@ -96,7 +96,31 @@ export const HIGH_RISK_RULES = Object.freeze([
   { id: 'high:rm-recursive-unix', test: /\brm\s+(-[a-z]*\s+)*-rf\b/i, note: '非盘根递归删除(Unix)', surface: true },
   // 普通 git push（非 --force）设计文档列为 deny → 高风险档；--force 变体由 HARD 拦截。
   { id: 'high:git-push', test: /\bgit\b[^\n]*\bpush\b/i, note: 'git 推送(非强制)', surface: true },
+  // 动态执行变量（`& $exe args`、`iex $x`）：正常脚本里也常见，故为高风险而非硬拒绝；
+  // 若字符串里确实藏着危险命令，会先被上方的拼接检测判为 HARD。
+  { id: 'high:dyn-call', test: /(^|[;&|]\s*)(&|\.)\s*\$[A-Za-z_]|(^|[;&|]\s*)(iex|invoke-expression)\s+\$/i, note: '动态执行变量(可能是拼接命令)', surface: true },
 ])
+
+/**
+ * 动态执行 / 变量拼接形态。这些写法会把命令藏进字符串或拆成片段，
+ * `executionSurface()` 剥离引号与赋值后「命令面」什么都不剩，静态规则随之失明。
+ * @type {RegExp}
+ */
+export const CONCAT_EXEC_PATTERN = /(^|[;&|]\s*)(iex|invoke-expression)\s+\$|(^|[;&|]\s*)(&|\.)\s*\$|\$[A-Za-z_][A-Za-z0-9_]*\s*\$\s*[A-Za-z_]/i
+
+/**
+ * 被拆进字符串的 cmdlet 动词片段：`'Remove-'`、`'Stop-'`、`'Format-'` 这类
+ * 「动词 + 连字符结尾」——正常文案几乎不会长这样，是拼接执行的强特征。
+ * @type {RegExp}
+ */
+export const CMDLET_FRAGMENT_PATTERN = /^\s*(remove|ri|rd|rmdir|del|erase|format|diskpart|shutdown|restart|stop|start|clear|invoke|iex|reg|sc|net|icacls|takeown|sudo|runas|apt|apt-get|pip|pip3|winget|scoop|choco|bcdedit|schtasks|set|new|add|disable|enable|move|copy|rename|restore|import|export|remove-item)\s*-\s*$/i
+
+/**
+ * 纯输出类 cmdlet（`Write-Host` / `echo` / `Write-Output` …）。
+ * 它们的参数与正文一样是**数据**，不是命令——用于放行「文案里提到危险词」的误伤。
+ * @type {RegExp}
+ */
+export const OUTPUT_ONLY_PATTERN = /^\s*(write-host|write-output|write-information|write-verbose|write-debug|write-warning|echo|print|out-string|out-host)\b/i
 
 /**
  * 允许（低风险）。命中即 `allow`（仅当 HARD / HIGH 未命中时）。

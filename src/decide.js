@@ -12,7 +12,7 @@
  */
 
 import path from 'node:path'
-import { ALLOW_RULES, executionSurface, HARD_DENY_RULES, HIGH_RISK_RULES, PROTECTED_TARGETS, projectTarget, READ_PATH_TOOLS } from './rules.js'
+import { ALLOW_RULES, CMDLET_FRAGMENT_PATTERN, CONCAT_EXEC_PATTERN, executionSurface, HARD_DENY_RULES, HIGH_RISK_RULES, OUTPUT_ONLY_PATTERN, PROTECTED_TARGETS, projectTarget, READ_PATH_TOOLS } from './rules.js'
 
 /** 决策结果的风险级。 */
 export const RISK = Object.freeze({ LOW: 'low', MEDIUM: 'medium', HIGH: 'high', HARD: 'hard' })
@@ -116,6 +116,9 @@ export function classifyByRules({ toolName, args, workspace }) {
   const surface = target.kind === 'command' ? executionSurface(target.text) : ''
 
   // 1) HARD —— 最高优先，任何 lower 档策略都不能推翻
+  //    纯输出 cmdlet（Write-Host / echo …）的参数是数据不是命令，因此这类命令一律用
+  //    **执行面**匹配（连非 surface 规则也一样），避免「文案里提到危险词」被误拦。
+  const outputOnly = target.kind === 'command' && OUTPUT_ONLY_PATTERN.test(surface)
   if (target.text !== '') {
     for (const rule of HARD_DENY_RULES) {
       const isReadOnlyPathTool = target.kind === 'path' && READ_PATH_TOOLS.includes(toolName)
@@ -124,7 +127,7 @@ export function classifyByRules({ toolName, args, workspace }) {
       //  - 命令类工具只有「写命令」才判定——`Get-Content 'C:\Program Files\…'`
       //    或 `[IO.File]::ReadAllText(...settings.yaml)` 是读取（2026-09-09 实测误拦）。
       if ((rule.id === 'hard:protected-path' || rule.id === 'hard:dsh-config') && (isReadOnlyPathTool || (target.kind !== 'path' && !WRITE_COMMAND_PATTERN.test(target.text)))) continue
-      const textFor = rule.surface === true ? surface : target.text
+      const textFor = rule.surface === true || outputOnly ? surface : target.text
       if (rule.test.test(textFor)) {
         return { decision: 'deny', risk: RISK.HARD, rule: rule.id, note: rule.note }
       }
@@ -136,6 +139,27 @@ export function classifyByRules({ toolName, args, workspace }) {
   //      `New-Item ...\.dsh\...` 成功写入）。
   if (target.kind === 'command' && WRITE_COMMAND_PATTERN.test(target.text) && PROTECTED_TARGETS.some((pattern) => pattern.test(target.text))) {
     return { decision: 'deny', risk: RISK.HARD, rule: 'hard:protected-target', note: '受保护目标（配置/凭据/git 元数据）' }
+  }
+
+  // 1.6) 拼接 / 动态执行（2026-09-10 实测漏拦修复）：
+  //      `$p1='Remove-'; $p2='Item -Recurse -Force C:\'; & $p1$p2`、`$c='diskpart'; & $c`、
+  //      `$x='shutdown /s'; iex $x` 这类写法把命令藏进字符串或拆成片段，命令面
+  //      （executionSurface）剥离引号与赋值后什么都不剩，上面的 HARD 规则全部失明。
+  //      仅在**确实出现动态执行形态**时，才把引号内的字符串当真实命令再查一遍——
+  //      这正是 `Write-Host 'rm -rf /'` 这类纯文案不会被牵连的原因。
+  if (target.kind === 'command' && CONCAT_EXEC_PATTERN.test(target.text)) {
+    for (const chunk of target.text.match(/"[^"\n]*"|'[^'\n]*'/g) ?? []) {
+      const inner = chunk.slice(1, -1).trim()
+      if (inner === '') continue
+      if (CMDLET_FRAGMENT_PATTERN.test(inner)) {
+        return { decision: 'deny', risk: RISK.HARD, rule: 'hard:concat-fragment', note: `命令片段「${inner}」被拆进字符串后拼接执行` }
+      }
+      for (const rule of HARD_DENY_RULES) {
+        if (rule.test.test(inner)) {
+          return { decision: 'deny', risk: RISK.HARD, rule: `hard:concat-exec:${rule.id}`, note: '动态拼接执行的命令片段' }
+        }
+      }
+    }
   }
 
   // 2) HIGH —— 高风险，按 riskPolicies.high 分派；递归删除对工作区内路径豁免

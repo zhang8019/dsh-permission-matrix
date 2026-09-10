@@ -354,3 +354,41 @@ test('极高风险策略：只允许 deny / ask / password，allow 一律 fail-c
   assert.equal(applyRiskPolicy('low', { low: 'allow' }).decision, 'allow')
   assert.equal(applyRiskPolicy('medium', { medium: 'nonsense' }).decision, 'deny', '未知值按最保守处理')
 })
+
+// ── 拼接 / 动态执行绕过（2026-09-10 实测漏拦修复） ──────────────────────────
+
+test('拼接执行：把命令拆进字符串再拼接 → 硬拒绝（此前全部漏拦）', () => {
+  const bypasses = [
+    "$p1='Remove-'; $p2='Item -Recurse -Force C:\\'; & $p1$p2",
+    "$p1='Remove-'\n$p2='Item -Recurse -Force C:\\'\n& $p1$p2",
+    "$c='diskpart'; & $c",
+    "$x='shutdown /s'; iex $x",
+    "$cmd='net user hacker P@ss /add'; Invoke-Expression $cmd",
+    "$a='rm -rf /'; & $a",
+    "$r='reg add HKCU\\Software\\X /v Y /d Z'; & $r",
+  ]
+  for (const command of bypasses) {
+    const verdict = classifyByRules(cmd(command))
+    assert.equal(verdict?.decision, 'deny', command)
+    assert.equal(verdict?.risk, 'hard', command)
+  }
+})
+
+test('拼接执行：纯输出文案不受牵连（引号里的危险词是数据，不是命令）', () => {
+  const documentation = [
+    "Write-Host 'rm -rf / 只是文案'",
+    'echo "shutdown /s 只是说明"',
+    "Write-Output 'net user /add 示例'",
+    "Write-Host 'diskpart 用法'",
+  ]
+  for (const command of documentation) {
+    const verdict = classifyByRules(cmd(command))
+    assert.notEqual(verdict?.risk, 'hard', command)
+  }
+})
+
+test('动态执行单个变量：正常用法落到高风险档（可配 ask/password），不硬拒绝', () => {
+  const verdict = classifyByRules(cmd('& $someExe --version'))
+  assert.equal(verdict?.risk, 'high')
+  assert.equal(verdict?.rule, 'high:dyn-call')
+})
