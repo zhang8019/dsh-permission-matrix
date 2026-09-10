@@ -3,9 +3,9 @@
  *
  * 清单来源：`dsh-auto-classifier` 的默认 deny/allow 表 + `dsh-yolo-mode` 的
  * dangerousPatterns，合并去重后按本插件的四段式使用：
- *   - HARD（极高风险）→ 默认 `deny`；可配置 `ask` 时走「批准密码」通道，
- *     拦截后须在设置页输入极高风险批准密码才放行一次（见 hard-approval.js）；
- *   - HIGH（高风险）→ 交给 `riskPolicies.high` 策略（默认 deny，可配 ask）；
+ *   - HARD（极高风险）→ 默认 `deny`；可配置 `ask` / `password` 时走「密码批准」通道，
+ *     挂起后须输入批准密码才放行一次（见 password-approval.js）；
+ *   - HIGH（高风险）→ 交给 `riskPolicies.high` 策略（默认 deny，可配 ask / password）；
  *   - ALLOW（低风险）→ `allow`；
  *   - 三者都未命中 → 交给 LLM 裁判 / 中档策略。
  *
@@ -31,7 +31,7 @@ export const PATH_TOOLS = ['write', 'edit', 'read', 'read_image']
 export const READ_PATH_TOOLS = ['read', 'read_image']
 
 /**
- * 硬拒绝（极高风险）。默认 `deny`；`riskPolicies.hard = 'ask'` 时走批准密码通道，
+ * 硬拒绝（极高风险）。默认 `deny`；`riskPolicies.hard = 'ask' | 'password'` 时走密码批准通道，
  * 不允许配置为 `allow`。命中即最高优先，任何 lower 档策略不能推翻。
  * @type {ReadonlyArray<{id: string, test: RegExp, note: string, surface?: boolean}>}
  */

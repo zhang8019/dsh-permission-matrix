@@ -10,12 +10,12 @@
  *   GET  /dsh-permission-matrix/models  已配置模型清单（裁判模型下拉）
  *   GET  /dsh-permission-matrix/global  全局默认预设（permission 命名空间）
  *   POST /dsh-permission-matrix/global  写全局默认预设
- *   GET  /dsh-permission-matrix/hard-approval   极高风险批准状态（密码是否已设 / 待批准请求 / 令牌）
- *   POST /dsh-permission-matrix/hard-approval   极高风险批准动作（设置密码 / 批准 / 授权下一次）
- *   GET  /dsh-permission-matrix/approve         浏览器直开的批准页（无 JS 依赖，纯表单）
+ *   GET  /dsh-permission-matrix/password-approval   密码批准状态（密码是否已设 / 待批准请求 / 令牌）
+ *   POST /dsh-permission-matrix/password-approval   密码批准动作（设置密码 / 批准 / 授权下一次）
+ *   GET  /dsh-permission-matrix/approve             浏览器直开的批准页（无 JS 依赖，纯表单）
  *
- * 安全约束：`hardApprovalPasswordHash` **永不**出现在任何响应里（`/status` 只回一个
- * `hardApprovalPasswordSet` 布尔），也不在 WRITABLE_KEYS 中——只能经专用动作路由写入。
+ * 安全约束：`approvalPasswordHash` **永不**出现在任何响应里（`/status` 只回一个
+ * `approvalPasswordSet` 布尔），也不在 WRITABLE_KEYS 中——只能经专用动作路由写入。
  *
  * @module dsh-permission-matrix/settings
  */
@@ -34,7 +34,7 @@ export const WRITABLE_KEYS = Object.freeze([
   'judgeModel',
   'judgeStages',
   'autoAllowHardGuard',
-  'hardApprovalTtlMs',
+  'approvalPasswordTtlMs',
   'robotDefaultPreset',
   'robotWorkspaces',
   'gitSnapshot',
@@ -46,11 +46,12 @@ export const WRITABLE_KEYS = Object.freeze([
 /**
  * 剥离密钥后再回给浏览器的配置投影。
  * @param {object} config - 当前配置。
- * @returns {object} 可安全回传的配置（含 `hardApprovalPasswordSet` 布尔）。
+ * @returns {object} 可安全回传的配置（含 `approvalPasswordSet` 布尔）。
  */
 export function sanitizeConfig(config) {
-  const { hardApprovalPasswordHash, ...rest } = config ?? {}
-  return Object.assign({}, rest, { hardApprovalPasswordSet: String(hardApprovalPasswordHash ?? '') !== '' })
+  const { approvalPasswordHash, hardApprovalPasswordHash, ...rest } = config ?? {}
+  const set = String(approvalPasswordHash ?? '') !== '' || String(hardApprovalPasswordHash ?? '') !== ''
+  return Object.assign({}, rest, { approvalPasswordSet: set })
 }
 
 /** HTML 转义（批准页把工具名/目标回显到页面，必须转义）。 */
@@ -154,7 +155,7 @@ export function installSettings(ctx, config, schema, onSource) {
  * @param {object} deps - 依赖。
  * @param {() => object} deps.getConfig - 读取当前配置。
  * @param {() => {recent: (n: number) => object[], file: string}} deps.getAudit - 读取审计器。
- * @param {() => object} [deps.getHardApproval] - 读取极高风险批准管理器（密码通道）。
+ * @param {() => object} [deps.getPasswordApproval] - 读取密码批准管理器。
  * @returns {void}
  */
 export function registerRoutes(ctx, deps) {
@@ -166,12 +167,12 @@ export function registerRoutes(ctx, deps) {
       const statusSnapshot = () => {
         const config = deps.getConfig()
         const audit = deps.getAudit()
-        const hardApproval = deps.getHardApproval?.()
+        const passwordApproval = deps.getPasswordApproval?.()
         return {
           ok: true,
           presets: PRESETS,
           config: sanitizeConfig(config),
-          hardApproval: hardApproval?.snapshot?.() ?? null,
+          passwordApproval: passwordApproval?.snapshot?.() ?? null,
           auditFile: audit.file,
           recent: audit.recent(10),
         }
@@ -323,13 +324,13 @@ export function registerRoutes(ctx, deps) {
         }),
         webServer.register({
           kind: 'exact',
-          path: '/dsh-permission-matrix/hard-approval',
+          path: '/dsh-permission-matrix/password-approval',
           handler: async (req, res) => {
-            // 极高风险批准通道：读状态 / 执行批准动作。密码哈希永不出现在响应里。
-            const hardApproval = deps.getHardApproval?.()
-            if (hardApproval === undefined) return sendJson(res, 503, { ok: false, error: 'hard approval channel unavailable' })
+            // 密码批准通道：读状态 / 执行批准动作。密码哈希永不出现在响应里。
+            const passwordApproval = deps.getPasswordApproval?.()
+            if (passwordApproval === undefined) return sendJson(res, 503, { ok: false, error: 'password approval channel unavailable' })
             try {
-              if (req.method === 'GET') return sendJson(res, 200, Object.assign({ ok: true }, hardApproval.snapshot()))
+              if (req.method === 'GET') return sendJson(res, 200, Object.assign({ ok: true }, passwordApproval.snapshot()))
               if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' })
 
               const body = JSON.parse((await readBody(req)) || '{}')
@@ -337,44 +338,61 @@ export function registerRoutes(ctx, deps) {
               const settings = webCtx.get('settings')
 
               if (action === 'set-password') {
-                const prepared = hardApproval.preparePassword({
+                const prepared = passwordApproval.preparePassword({
                   currentPassword: body.currentPassword,
                   newPassword: body.newPassword,
                   confirmPassword: body.confirmPassword,
                 })
-                if (!prepared.ok) return sendJson(res, 400, Object.assign({ ok: false, error: prepared.error }, hardApproval.snapshot()))
+                if (!prepared.ok) return sendJson(res, 400, Object.assign({ ok: false, error: prepared.error }, passwordApproval.snapshot()))
                 if (settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service unavailable' })
-                await settings.mutate(MATRIX_NS, [{ op: 'set', path: ['hardApprovalPasswordHash'], value: prepared.hash }])
-                ctx.logger.info('permission-matrix: hard approval password set')
-                return sendJson(res, 200, Object.assign({ ok: true, message: '批准密码已保存' }, hardApproval.snapshot()))
+                // 写新键，并把 v0.3.0 的旧键清空（改名的同时完成迁移，不丢已设口令）。
+                await settings.mutate(MATRIX_NS, [
+                  { op: 'set', path: ['approvalPasswordHash'], value: prepared.hash },
+                  { op: 'set', path: ['hardApprovalPasswordHash'], value: '' },
+                ])
+                ctx.logger.info('permission-matrix: approval password set')
+                return sendJson(res, 200, Object.assign({ ok: true, message: '批准密码已保存' }, passwordApproval.snapshot()))
               }
 
               if (action === 'clear-password') {
-                const verdict = hardApproval.checkPassword(body.password)
-                if (!verdict.ok) return sendJson(res, 400, Object.assign({ ok: false, error: verdict.error }, hardApproval.snapshot()))
+                const verdict = passwordApproval.checkPassword(body.password)
+                if (!verdict.ok) return sendJson(res, 400, Object.assign({ ok: false, error: verdict.error }, passwordApproval.snapshot()))
                 if (settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service unavailable' })
-                await settings.mutate(MATRIX_NS, [{ op: 'set', path: ['hardApprovalPasswordHash'], value: '' }])
-                ctx.logger.warn('permission-matrix: hard approval password cleared (hard risks now always denied)')
-                return sendJson(res, 200, Object.assign({ ok: true, message: '批准密码已清除：极高风险操作将一律拒绝' }, hardApproval.snapshot()))
+                await settings.mutate(MATRIX_NS, [
+                  { op: 'set', path: ['approvalPasswordHash'], value: '' },
+                  { op: 'set', path: ['hardApprovalPasswordHash'], value: '' },
+                ])
+                ctx.logger.warn('permission-matrix: approval password cleared (password-gated tiers now always deny)')
+                return sendJson(res, 200, Object.assign({ ok: true, message: '批准密码已清除：选了「密码批准」的风险档将一律拒绝' }, passwordApproval.snapshot()))
               }
 
               if (action === 'approve') {
-                const result = hardApproval.approveRequest({ requestId: body.requestId, password: body.password })
-                if (!result.ok) return sendJson(res, 400, Object.assign({ ok: false, error: result.error }, hardApproval.snapshot()))
-                ctx.logger.info(`permission-matrix: hard approval granted for ${body.requestId}`)
-                return sendJson(res, 200, Object.assign({ ok: true, message: '已批准：请让模型重新执行该操作即可放行', grant: result.grant }, hardApproval.snapshot()))
+                const result = passwordApproval.approveRequest({ requestId: body.requestId, password: body.password })
+                if (!result.ok) return sendJson(res, 400, Object.assign({ ok: false, error: result.error }, passwordApproval.snapshot()))
+                // delivered='call'：被挂起的调用已经拿到放行，不需要模型重试；
+                // delivered='grant'：调用已结束，签了一张令牌等模型重试时消费。
+                const message = result.delivered === 'call'
+                  ? '已批准：被挂起的那次调用已立即放行'
+                  : '已批准：请让模型重新执行该操作即可放行'
+                ctx.logger.info(`permission-matrix: password approval granted for ${body.requestId} (delivered=${String(result.delivered)})`)
+                return sendJson(res, 200, Object.assign({
+                  ok: true,
+                  message,
+                  delivered: result.delivered,
+                  grant: result.grant ?? null,
+                }, passwordApproval.snapshot()))
               }
 
               if (action === 'authorize-next') {
-                const result = hardApproval.authorizeNext({ password: body.password })
-                if (!result.ok) return sendJson(res, 400, Object.assign({ ok: false, error: result.error }, hardApproval.snapshot()))
-                ctx.logger.info('permission-matrix: next hard operation authorized by password')
-                return sendJson(res, 200, Object.assign({ ok: true, message: '已授权：下一次极高风险操作将被放行一次', grant: result.grant }, hardApproval.snapshot()))
+                const result = passwordApproval.authorizeNext({ password: body.password })
+                if (!result.ok) return sendJson(res, 400, Object.assign({ ok: false, error: result.error }, passwordApproval.snapshot()))
+                ctx.logger.info('permission-matrix: next password-gated operation authorized')
+                return sendJson(res, 200, Object.assign({ ok: true, message: '已授权：下一次需密码的操作将被放行一次', grant: result.grant }, passwordApproval.snapshot()))
               }
 
               if (action === 'dismiss') {
-                const removed = hardApproval.dismissRequest(body.requestId)
-                return sendJson(res, 200, Object.assign({ ok: true, message: removed ? '已忽略该请求' : '该请求已不存在' }, hardApproval.snapshot()))
+                const removed = passwordApproval.dismissRequest(body.requestId)
+                return sendJson(res, 200, Object.assign({ ok: true, message: removed ? '已忽略该请求' : '该请求已不存在' }, passwordApproval.snapshot()))
               }
 
               return sendJson(res, 400, { ok: false, error: `unknown action: ${action || '(empty)'}` })
@@ -387,20 +405,22 @@ export function registerRoutes(ctx, deps) {
           kind: 'exact',
           path: '/dsh-permission-matrix/approve',
           handler: async (req, res) => {
-            // 浏览器直开的批准页（纯表单、无需前端脚本）：拦截提示里可以把它给用户。
-            const hardApproval = deps.getHardApproval?.()
-            if (hardApproval === undefined) return sendHtml(res, 503, pageShell('批准通道不可用', '<p>插件未加载批准通道。</p>'))
+            // 浏览器直开的批准页（纯表单、无需前端脚本）：挂起提示里可以把它给用户。
+            const passwordApproval = deps.getPasswordApproval?.()
+            if (passwordApproval === undefined) return sendHtml(res, 503, pageShell('批准通道不可用', '<p>插件未加载批准通道。</p>'))
 
             let notice = ''
             if (req.method === 'POST') {
               try {
                 const form = await readFormBody(req)
                 if (String(form.action ?? '') === 'authorize-next') {
-                  const result = hardApproval.authorizeNext({ password: form.password })
-                  notice = result.ok ? ok('已授权：下一次极高风险操作将被放行一次。') : bad(result.error)
+                  const result = passwordApproval.authorizeNext({ password: form.password })
+                  notice = result.ok ? ok('已授权：下一次需密码的操作将被放行一次。') : bad(result.error)
                 } else {
-                  const result = hardApproval.approveRequest({ requestId: form.requestId, password: form.password })
-                  notice = result.ok ? ok('已批准：请让模型重新执行该操作即可放行。') : bad(result.error)
+                  const result = passwordApproval.approveRequest({ requestId: form.requestId, password: form.password })
+                  notice = result.ok
+                    ? ok(result.delivered === 'call' ? '已批准：被挂起的那次调用已立即放行。' : '已批准：请让模型重新执行该操作即可放行。')
+                    : bad(result.error)
                 }
               } catch (error) {
                 notice = bad(String(error?.message ?? error))
@@ -409,16 +429,16 @@ export function registerRoutes(ctx, deps) {
               return sendHtml(res, 405, pageShell('方法不允许', '<p>仅支持 GET / POST。</p>'))
             }
 
-            const snap = hardApproval.snapshot()
+            const snap = passwordApproval.snapshot()
             if (!snap.passwordSet) {
               return sendHtml(
                 res,
                 200,
-                pageShell('极高风险批准', `${notice}<p>尚未设置「极高风险批准密码」，因此没有任何放行路径。</p><p>请到 GUI 的「设置 → 权限矩阵 → 极高风险批准密码」中设置密码。</p>`),
+                pageShell('密码批准', `${notice}<p>尚未设置「批准密码」，因此没有任何放行路径。</p><p>请到 GUI 的「设置 → 权限矩阵 → 批准密码」中设置密码。</p>`),
               )
             }
             const rows = snap.pending.length === 0
-              ? '<p>当前没有待批准的极高风险请求。</p>'
+              ? '<p>当前没有待批准的请求。</p>'
               : `<form method="post" action="/dsh-permission-matrix/approve">
   ${snap.pending.map((item) => `<label style="display:block;margin:6px 0"><input type="radio" name="requestId" value="${escapeHtml(item.id)}" required> <b>${escapeHtml(item.toolName)}</b> <span style="color:#888">${escapeHtml(item.at)}</span><br><span style="font-family:monospace;font-size:12px;word-break:break-all">${escapeHtml(item.target)}</span></label>`).join('\n  ')}
   <p><input type="password" name="password" placeholder="批准密码" required autocomplete="off" style="padding:6px;width:220px"></p>
@@ -426,12 +446,12 @@ export function registerRoutes(ctx, deps) {
 </form>`
             const grantRows = snap.grants.length === 0
               ? ''
-              : `<h3>生效中的批准（${snap.grants.length}）</h3><ul>${snap.grants.map((grant) => `<li>${escapeHtml(grant.toolName || '任意极高风险操作')} — 剩余 ${Math.round(grant.expiresInMs / 1000)} 秒</li>`).join('')}</ul>`
-            return sendHtml(res, 200, pageShell('极高风险批准', `
+              : `<h3>生效中的批准（${snap.grants.length}）</h3><ul>${snap.grants.map((grant) => `<li>${escapeHtml(grant.toolName || '任意需密码操作')} — 剩余 ${Math.round(grant.expiresInMs / 1000)} 秒</li>`).join('')}</ul>`
+            return sendHtml(res, 200, pageShell('密码批准', `
 ${notice}
-<h3>待批准的极高风险请求（${snap.pending.length}）</h3>
+<h3>待批准的请求（${snap.pending.length}）</h3>
 ${rows}
-<h3>授权下一次极高风险操作</h3>
+<h3>授权下一次需密码的操作</h3>
 <form method="post" action="/dsh-permission-matrix/approve">
   <input type="hidden" name="action" value="authorize-next">
   <p><input type="password" name="password" placeholder="批准密码" required autocomplete="off" style="padding:6px;width:220px"></p>

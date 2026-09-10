@@ -1,21 +1,25 @@
 /**
- * 极高风险「批准密码」通道（取代 v0.2 的双重人工确认）。
+ * 「密码批准」通道 —— 与「放行 / 拒绝 / 转人工」并列的第四种审批方式。
  *
- * 为什么替换：双重确认要求「模型在窗口内原样重发同一条命令」才能完成第 2 次放行，
- * 而模型收到拒绝后通常改路径重试（指纹随之改变），实测审计 1000+ 条中
- * `hard-confirm-2` 从未出现——即极高风险操作事实上无法被人工放行。改为
- * 密码批准后，放行与否只取决于「是否提供了正确的批准密码」，不再依赖模型行为。
+ * 任何风险档（低 / 中 / 高 / 极高）都可以把策略配成 `password`：该档的操作会被**挂起**，
+ * 由本插件的密码弹窗（`shell.overlay`）/ 设置页 / 批准页要求输入批准密码，输对了当场放行，
+ * 输错或超时则拒绝。`ask`（转人工）与它的区别是：转人工只是点一下「同意」，
+ * 而密码批准要求知道口令——因此不会被"多点几次同意"绕过。
+ *
+ * 为什么要有它：v0.2 的「极高风险双重人工确认」要求「模型在窗口内原样重发同一条命令」
+ * 才能完成第 2 次放行，而模型被拒后通常改路径重试（指纹随之改变），实测审计 1000+ 条中
+ * `hard-confirm-2` 从未出现——等于那条路根本走不通。密码批准只取决于"是否知道口令"，
+ * 与模型行为无关。
  *
  * 语义（fail-closed）：
- *   1. 极高风险操作被拦截时登记一条「待批准请求」（内存，重启即失效）；
- *   2. 用户在设置页 / 批准页输入批准密码 → 校验 scrypt 哈希 → 签发**一次性**令牌；
- *      令牌可绑定「某条待批准请求的指纹」（只放行那一个操作）或为通配（放行下一次）；
- *   3. 令牌在 TTL 内、被使用一次后立即失效；
- *   4. 未设置密码 → 一律拒绝（不存在"无密码放行"路径）。
+ *   1. 被挂起的调用登记一条「待批准请求」（内存，重启即失效）；
+ *   2. 用户输入批准密码 → 校验 scrypt 哈希 → 若调用仍在等则**当场放行**，
+ *      否则签发**一次性令牌**（绑定该指纹，供模型重试时消费）；
+ *   3. 未设置密码 → 一律拒绝（不存在"无密码放行"路径）。
  *
  * 密码只以 scrypt 哈希（salt + 参数）落在 settings 文档里，明文既不持久化也不回传浏览器。
  *
- * @module dsh-permission-matrix/hard-approval
+ * @module dsh-permission-matrix/password-approval
  */
 
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
@@ -87,19 +91,27 @@ export function verifyPassword(plain, stored) {
  * @param {() => number} [clock] - 时钟（测试注入）。
  * @returns {object} 管理器 API。
  */
-export function makeHardApproval(getConfig, logger, clock) {
+export function makePasswordApproval(getConfig, logger, clock) {
   const now = typeof clock === 'function' ? clock : () => Date.now()
 
   /** 待批准请求：id → record。 */
   const pending = new Map()
   /** 已签发令牌：id → grant。 */
   const grants = new Map()
+  /** 正挂在审批瀑布里等密码的调用：requestId → { promise, finish }。 */
+  const waiters = new Map()
 
   const ttlMs = () => {
-    const value = Number(getConfig()?.hardApprovalTtlMs)
+    const config = getConfig() ?? {}
+    // `hardApprovalTtlMs` 是 v0.3.0 的旧键（当时只服务极高风险），保留兼容读取。
+    const value = Number(config.approvalPasswordTtlMs ?? config.hardApprovalTtlMs)
     return Number.isFinite(value) && value > 0 ? value : DEFAULT_TTL_MS
   }
-  const storedHash = () => String(getConfig()?.hardApprovalPasswordHash ?? '')
+  const storedHash = () => {
+    const config = getConfig() ?? {}
+    // 新键优先；旧键（v0.3.0 的 hardApprovalPasswordHash）继续可读，改名不丢已设口令。
+    return String(config.approvalPasswordHash ?? '') || String(config.hardApprovalPasswordHash ?? '')
+  }
   const passwordSet = () => storedHash() !== ''
 
   const prune = () => {
@@ -138,14 +150,14 @@ export function makeHardApproval(getConfig, logger, clock) {
    * @returns {{ok: true} | {ok: false, error: string}} 结果。
    */
   const checkPassword = (password) => {
-    if (!passwordSet()) return { ok: false, error: '尚未设置「极高风险批准密码」，请先在设置页设置' }
+    if (!passwordSet()) return { ok: false, error: '尚未设置「批准密码」，请先在设置页设置' }
     if (!verifyPassword(String(password ?? ''), storedHash())) return { ok: false, error: '批准密码不正确' }
     return { ok: true }
   }
 
   /**
-   * 登记一条待批准的极高风险请求（同指纹未过期的请求复用同一条记录）。
-   * @param {{sessionId?: string, fingerprint: string, toolName: string, target?: string, preset?: string, rule?: string}} input - 请求信息。
+   * 登记一条待批准的密码请求（同指纹未过期的请求复用同一条记录）。
+   * @param {{sessionId?: string, fingerprint: string, toolName: string, target?: string, preset?: string, rule?: string, risk?: string}} input - 请求信息。
    * @returns {{id: string, reused: boolean}} 登记结果。
    */
   const registerRequest = (input) => {
@@ -156,6 +168,7 @@ export function makeHardApproval(getConfig, logger, clock) {
       if (record.fingerprint === fingerprint && record.sessionId === sessionId && record.approvedAt === null) {
         record.toolName = String(input?.toolName ?? record.toolName)
         record.target = String(input?.target ?? record.target)
+        if (input?.risk !== undefined) record.risk = String(input.risk)
         return { id: record.id, reused: true }
       }
     }
@@ -169,10 +182,61 @@ export function makeHardApproval(getConfig, logger, clock) {
       target: String(input?.target ?? '').slice(0, 300),
       preset: String(input?.preset ?? ''),
       rule: String(input?.rule ?? ''),
+      risk: String(input?.risk ?? ''),
       approvedAt: null,
       approvedGrantId: null,
     })
     return { id, reused: false }
+  }
+
+  /**
+   * 结算某个请求上的等待者。
+   * @param {string} requestId - 请求 id。
+   * @param {'allowed' | 'declined' | 'timeout' | 'cancelled'} outcome - 结论。
+   * @returns {boolean} 是否有等待者被结算。
+   */
+  const settleWaiter = (requestId, outcome) => {
+    const waiter = waiters.get(String(requestId ?? ''))
+    if (waiter === undefined) return false
+    waiter.finish(outcome)
+    return true
+  }
+
+  /**
+   * 让审批瀑布挂起、等待密码批准（GUI 弹窗与批准页两条通道都通向这里）。
+   *
+   * 这是「直接弹窗填写」的关键：被拦的调用**不会失败**，而是挂在那儿等密码；
+   * 用户输对密码后本次调用立即放行，不需要模型重试。超时/取消则回落为拒绝，
+   * 同时该请求仍留在待批准列表里——用户之后批准会签一张令牌，供模型重试使用。
+   * @param {{requestId: string, timeoutMs?: number, signal?: object}} input - 输入。
+   * @returns {Promise<'allowed' | 'declined' | 'timeout' | 'cancelled'>} 结论。
+   */
+  const waitForDecision = ({ requestId, timeoutMs, signal } = {}) => {
+    const id = String(requestId ?? '')
+    const existing = waiters.get(id)
+    if (existing !== undefined) return existing.promise
+    if (signal?.aborted === true) return Promise.resolve('cancelled')
+
+    let resolveOutcome
+    const promise = new Promise((resolve) => {
+      resolveOutcome = resolve
+    })
+    let settled = false
+    let timer = null
+    let onAbort = null
+    const finish = (outcome) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      if (onAbort !== null) signal?.removeEventListener?.('abort', onAbort)
+      waiters.delete(id)
+      resolveOutcome(outcome)
+    }
+    onAbort = () => finish('cancelled')
+    timer = setTimeout(() => finish('timeout'), Math.max(0, Number(timeoutMs) || ttlMs()))
+    signal?.addEventListener?.('abort', onAbort, { once: true })
+    waiters.set(id, { promise, finish })
+    return promise
   }
 
   /**
@@ -187,6 +251,13 @@ export function makeHardApproval(getConfig, logger, clock) {
     const record = pending.get(String(requestId ?? ''))
     if (record === undefined) return { ok: false, error: '找不到该待批准请求（可能已过期或已被处理）' }
     if (record.approvedAt !== null) return { ok: false, error: '该请求已被批准' }
+    // 该调用仍挂在审批瀑布里等密码 → 直接放行本次调用（无需模型重试）
+    if (waiters.has(record.id)) {
+      record.approvedAt = now()
+      settleWaiter(record.id, 'allowed')
+      logger?.warn?.(`password-approval: delivered ${record.toolName} (${record.id}) to the waiting call`)
+      return { ok: true, delivered: 'call' }
+    }
     const grant = {
       id: `hg-${randomUUID().slice(0, 8)}`,
       at: now(),
@@ -199,12 +270,12 @@ export function makeHardApproval(getConfig, logger, clock) {
     grants.set(grant.id, grant)
     record.approvedAt = now()
     record.approvedGrantId = grant.id
-    logger?.warn?.(`hard-approval: granted ${record.toolName} (${record.id}) → ${grant.id}`)
-    return { ok: true, grant: describeGrant(grant) }
+    logger?.warn?.(`password-approval: granted ${record.toolName} (${record.id}) → ${grant.id}`)
+    return { ok: true, delivered: 'grant', grant: describeGrant(grant) }
   }
 
   /**
-   * 按密码签发一张「下一次极高风险操作」通配令牌（不绑定具体请求）。
+   * 按密码签发一张「下一次需密码操作」通配令牌（不绑定具体请求）。
    * @param {{password: string, sessionId?: string}} input - 输入。
    * @returns {{ok: boolean, error?: string, grant?: object}} 结果。
    */
@@ -222,7 +293,7 @@ export function makeHardApproval(getConfig, logger, clock) {
       requestId: null,
     }
     grants.set(grant.id, grant)
-    logger?.warn?.(`hard-approval: authorized next hard operation → ${grant.id}`)
+    logger?.warn?.(`password-approval: authorized next password-gated operation → ${grant.id}`)
     return { ok: true, grant: describeGrant(grant) }
   }
 
@@ -293,7 +364,9 @@ export function makeHardApproval(getConfig, logger, clock) {
           target: record.target,
           preset: record.preset,
           rule: record.rule,
+          risk: record.risk ?? '',
           sessionId: record.sessionId,
+          waiting: waiters.has(record.id),
         })),
       grants: [...grants.values()]
         .filter((grant) => grant.expiresAt > t)
@@ -314,11 +387,16 @@ export function makeHardApproval(getConfig, logger, clock) {
   }
 
   /**
-   * 丢弃一条待批准请求（用户误触拦截时清理）。
+   * 丢弃一条待批准请求（用户误触拦截时清理；若该调用仍挂着等待，则按拒绝结算）。
    * @param {string} requestId - 请求 id。
-   * @returns {boolean} 是否删除。
+   * @returns {boolean} 是否处理了该请求。
    */
-  const dismissRequest = (requestId) => pending.delete(String(requestId ?? ''))
+  const dismissRequest = (requestId) => {
+    const id = String(requestId ?? '')
+    const settled = settleWaiter(id, 'declined')
+    const existed = pending.delete(id)
+    return settled || existed
+  }
 
   return {
     passwordSet,
@@ -330,6 +408,7 @@ export function makeHardApproval(getConfig, logger, clock) {
     consume,
     snapshot,
     dismissRequest,
+    waitForDecision,
     ttlMs,
   }
 }

@@ -47,7 +47,7 @@
 
 ## 风险分级与判定顺序
 
-1. **硬拒绝(HARD)** → 默认直接拒绝,**人工也不能批准**(`riskPolicies.hard = 'deny'`);配为 `ask` 时改为**批准密码**通道(见下节),但**不提供「放行」选项**;
+1. **硬拒绝(HARD)** → 默认直接拒绝,**人工也不能批准**(`riskPolicies.hard = 'deny'`);配为 `ask` / `password` 时改为**密码批准**通道(见下节),但**不提供「放行」选项**;
 2. **高风险(HIGH)** → 按 `riskPolicies.high` 分派;非盘根递归/批量删除、普通 `git push` 走此档,**工作区内路径豁免**;
 3. **工作区内结构放行**(write/edit/read 且目标在会话工作区内)→ 放行(受保护目标除外:`~/.dsh`、凭据、`.git/config|hooks`);只读工具读取系统目录/配置同样放行——**读不是写**;
 4. **允许规则**(常规 git、包管理器查询、语言运行时、PowerShell cmdlet 等)→ 放行;
@@ -56,12 +56,13 @@
 
 | 风险级别 | 来源 | 默认策略 | 可选值 |
 |---|---|---|---|
-| **低** | 允许规则命中 / 工作区内操作 / 裁判判定安全 | `allow` | `allow` / `deny` / `ask` |
-| **中** | 规则未命中 / 裁判不确定 | `deny` | `allow` / `deny` / `ask` |
-| **高** | 裁判判定危险 / 非盘根递归删除 / `git push` | `deny` | `allow` / `deny` / `ask` |
-| **极高** | 硬拒绝清单(24 条) | `deny` | `deny` / `ask`(**不提供放行**) |
+| **低** | 允许规则命中 / 工作区内操作 / 裁判判定安全 | `allow` | `allow` / `deny` / `ask` / `password` |
+| **中** | 规则未命中 / 裁判不确定 | `deny` | `allow` / `deny` / `ask` / `password` |
+| **高** | 裁判判定危险 / 非盘根递归删除 / `git push` | `deny` | `allow` / `deny` / `ask` / `password` |
+| **极高** | 硬拒绝清单(24 条) | `deny` | `deny` / `ask` / `password`(**不提供放行**) |
 
-`ask`(转人工)在完全权限下同样可用,经 `tools/pre-execute` 返回 `{kind:'ask'}` → approval seam。
+- `ask`(转人工)在完全权限下同样可用,经 `tools/pre-execute` 返回 `{kind:'ask'}` → approval seam(浏览器审批弹窗,点同意即放行);
+- `password`(密码批准)= **挂起等密码**,由本插件自己的密码弹窗接管(见下节),与模型行为无关。
 
 ### 执行面识别(避免"提及即拦截")
 
@@ -69,22 +70,25 @@ HARD/HIGH 规则**只匹配真正会被执行的片段**:`executionSurface()` �
 
 同理,只读形态与写入形态被区分开:`schtasks /query`、`net user`(列用户)、`icacls <路径>`(查 ACL)、`bcdedit /enum`、`diskpart /?` 等只读查询与帮助文本放行,对应的写/变更形态仍然拒绝。
 
-### 极高风险「批准密码」
+### 「密码批准」——与放行 / 拒绝 / 转人工并列的第四种方式
 
-`riskPolicies.hard = 'ask'` 时,极高风险操作**必须凭批准密码放行**——无论点多少次审批弹窗都不会放行:
+**低 / 中 / 高 / 极高四档都可以选 `password`**：该档操作会被**挂起**（不失败），由本插件要求输入批准密码；输对了**当场执行**，输错或超时按拒绝处理。
 
-1. 操作被拦截(审计 `outcome=hard-password-required`),同时登记一条**待批准请求**(工具名 + 投影目标 + 指纹);
-2. 打开 **设置 → 权限矩阵 → 极高风险批准密码**,输入批准密码:
-   - **批准该请求** → 签发绑定该指纹的令牌(只放行那一个操作);
-   - **授权下一次极高风险操作** → 签发通配令牌(放行下一次任意极高风险操作);
-   - 也可直接用浏览器打开 `<Web 地址>/dsh-permission-matrix/approve`(纯表单页,无需前端脚本);
-3. 令牌在 `hardApprovalTtlMs`(默认 300 秒)内有效、**只放行一次**,用后即焚;
-4. 让模型重新执行该操作即可放行;令牌过期、指纹不同或会话不同都不放行。
+1. 挂起时登记一条**待批准请求**(工具名 + 投影目标 + 指纹 + 风险档,审计 `outcome=password-required`);
+2. 输入入口有三处(等价):
+   - **密码弹窗**:注册进 `shell.overlay` 槽位,浮在整个应用之上——出现即输入密码点「批准并立即放行」,**被挂起的那次调用当场执行**,不需要模型重试;点「忽略」按拒绝处理;
+   - **设置 → 权限矩阵 → 批准密码**:逐条「批准(放行一次)」,或「授权下一次需密码的操作」(通配);
+   - 浏览器打开 `<Web 地址>/dsh-permission-matrix/approve`(纯表单页,无需前端脚本);
+3. 超时(`approvalPasswordTtlMs`,默认 300 秒)未批准 → 该次调用按拒绝处理,但请求**仍留在列表里**:此时批准会签一张绑定该指纹的**一次性令牌**,模型重试即放行;
+4. 令牌/交付都只用一次:指纹不同、会话不同或过期均不放行。
 
-> 默认仍为 `deny`(直接拒绝)。设置页对极高风险档只提供「拒绝」与「转人工(需批准密码)」两个选项,配置 `allow` 会在加载期 fail-closed 拒绝。
-> **未设置批准密码 ⇒ 极高风险一律拒绝**,不存在任何绕过路径(该分支是 fail-closed 的)。
+> `password` 与 `ask` 的区别:`ask`(转人工)交给浏览器审批弹窗,点一下「同意」就放行;
+> `password` 必须**知道口令**,所以不会被"多点几次同意"绕过。极高风险档的 `ask` 与 `password` 等价(都走密码批准)。
+>
+> 极高风险默认仍为 `deny`(直接拒绝);设置页对极高风险档只提供「拒绝」与「需批准密码」,配置 `allow` 会在加载期 fail-closed 拒绝。
+> **未设置批准密码 ⇒ 所有选了「需批准密码」的档一律拒绝**(弹窗也会明示"无法放行")。
 
-**密码学**:口令以 **scrypt**(N=16384, r=8, p=1, 随机盐)哈希写入 settings 文档,明文既不落盘也**不回传浏览器**(`/status` 只回一个 `hardApprovalPasswordSet` 布尔);`hardApprovalPasswordHash` 不在设置页的可写键白名单里,只能经专用动作路由写入。待批准请求与令牌都在内存中,DSH 重启即失效。
+**密码学**:口令以 **scrypt**(N=16384, r=8, p=1, 随机盐)哈希存储,明文既不落盘也**不回传浏览器**(`/status` 只回一个 `approvalPasswordSet` 布尔);`approvalPasswordHash` 不在设置页的可写键白名单里,只能经专用动作路由写入。待批准请求与令牌都在内存中,DSH 重启即失效。
 
 **硬拒绝清单在设置页只读**,不可编辑——防止通过配置绕过硬边界。
 
@@ -129,8 +133,9 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 | `enabled` | `true` | 总开关 |
 | `takeover` | 见上表 | 预设 id → 审批档(`auto-allow` / `classify`) |
 | `riskPolicies` | `{low:allow, medium:deny, high:deny, hard:deny}` | 四档风险策略;极高风险只接受 `deny` / `ask` |
-| `hardApprovalPasswordHash` | 空 | 极高风险批准密码的 scrypt 哈希(设置页写入,明文不落盘;**不在**可写白名单,仅专用路由可写) |
-| `hardApprovalTtlMs` | `300000` | 批准令牌有效期(毫秒):密码批准后放行一次 |
+| `approvalPasswordHash` | 空 | 批准密码的 scrypt 哈希(设置页写入,明文不落盘;**不在**可写白名单,仅专用路由可写) |
+| `approvalPasswordTtlMs` | `300000` | 密码批准窗口(毫秒):挂起等待时长 / 令牌有效期 |
+| `hardApprovalPasswordHash` / `hardApprovalTtlMs` | — | **已废弃**(v0.3.0 旧键):仅兼容读取,写入一律用新键;已设口令不会因改名丢失 |
 | `llmJudge` | `true` | LLM 裁判开关 |
 | `judgeProvider` / `judgeModel` | 空 | 留空 = 跟随当前会话模型 |
 | `judgeStages` | `both` | `both` / `fast` / `thinking` |
@@ -152,7 +157,7 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 {"time":"2026-09-09T10:52:00.000Z","sessionId":"…","preset":"ww-classify","tool":"write","target":"D:\\out\\a.txt","risk":"medium","rule":"mid-policy:deny","source":"mid","decision":"deny","outcome":"blocked"}
 ```
 
-`outcome` 取值含 `passed` / `blocked` / `allowed-once` / `escalated-to-human` / `hard-password-required`(极高风险被拦、等待批准密码) / `hard-password-approved`(凭批准密码放行)。
+`outcome` 取值含 `passed` / `blocked` / `allowed-once` / `escalated-to-human` / `password-required`(挂起等密码) / `password-approved`(密码批准后放行) / `password-timeout` / `password-declined` / `password-cancelled`。
 
 只写文件与进程日志,**不进入模型 transcript**。
 
@@ -160,27 +165,27 @@ dsh plugin --profile <profile> add dsh-permission-matrix
 
 ```
 src/
-├── index.js           装配 + 三个钩子(tools/pre-execute、approval/request、session/created)+ 极高风险批准密码闸门
+├── index.js           装配 + 三个钩子(tools/pre-execute、approval/request、session/created)+ 密码批准闸门
 ├── presets.js         9 预设的单一真源
 ├── preset-router.js   当前会话预设 → 是否接管、以哪档接管
 ├── decide.js          决策核心(纯函数:HARD → HIGH → 区内放行 → 允许规则 → null)
 ├── rules.js           硬拒绝 / 高风险 / 允许规则表 + 执行面提取 + 字段投影
-├── hard-approval.js   极高风险批准密码(scrypt 哈希 + 待批准请求 + 一次性令牌)
+├── password-approval.js  「密码批准」通道(scrypt 哈希 + 待批准请求 + 挂起等待 + 一次性令牌)
 ├── judge.js           LLM 裁判(两阶段 + 跟随会话模型 + 失败降级)
 ├── snapshot.js        Git 快照
 ├── audit.js           JSONL 审计
 ├── robot-presets.js   机器人工作区 → 默认预设
 ├── settings.js        settings 命名空间 + webServer 同源路由(含批准页)
-└── client/index.js    设置页(手写 __ModuleLoader__ bundle)
+└── client/index.js    设置页 + 极高风险密码弹窗(手写 __ModuleLoader__ bundle,注册 settings.section 与 shell.overlay)
 ```
 
 ## 测试
 
 ```sh
-node --test tests/decide.test.js tests/hard-approval.test.js tests/hooks.test.js
+node --test tests/decide.test.js tests/password-approval.test.js tests/hooks.test.js
 ```
 
-60 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push`)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略、**极高风险批准密码(哈希校验 / 一次性令牌 / 指纹与会话绑定 / TTL / fail-closed / 端到端拦截→设密码→批准→放行)**、fail-closed 校验、防回环、机器人预设切换、总开关。
+66 条用例,覆盖:硬拒绝(删根目录 / 格式化 / 提权 / 强推 / `git reset --hard` / 系统级包安装)、高风险分派(非盘根递归删除 / `git push`)、工作区内递归删除豁免、受保护目标(路径类 + 命令类)、误拦回归(只读查询 / 注释与字符串里的关键词 / `_rsa` / 只读读系统目录 / 读 `settings.yaml`)、四档风险策略(含 `password` 值)、**密码批准(哈希校验 / 挂起与超时 / dismiss 与 abort / 一次性令牌 / 指纹与会话绑定 / fail-closed / 「弹窗输密码 → 挂起调用立即放行」端到端 / 中风险档同样生效)**、fail-closed 校验、防回环、机器人预设切换、总开关。
 
 ## 实测与修复记录(v0.2.0,2026-09-10)
 
@@ -221,7 +226,14 @@ node --test tests/decide.test.js tests/hard-approval.test.js tests/hooks.test.js
 
 **v0.3.0 替换方案**:极高风险不再依赖模型行为,改为**批准密码**——拦截后登记待批准请求,用户在设置页(或 `/dsh-permission-matrix/approve` 批准页)输入密码才签发一次性令牌放行;没有密码就永远拒绝。设置页新增「极高风险批准密码」区块(设置 / 修改 / 清除密码、待批准请求列表、授权下一次、批准有效期)。
 
-**破坏性变更**:`hardConfirmWindowMs` 由 `hardApprovalTtlMs` 取代;极高风险 `ask` 档不再产生人工审批弹窗(改走密码闸门);审计 `outcome` 用 `hard-password-required` / `hard-password-approved` 取代 `hard-ask-1` / `hard-confirm-2`。
+**破坏性变更**:`hardConfirmWindowMs` 由 `approvalPasswordTtlMs` 取代;极高风险 `ask` 档不再产生人工审批弹窗(改走密码闸门);审计 `outcome` 用 `password-required` / `password-approved` 取代 `hard-ask-1` / `hard-confirm-2`。
+
+### v0.3.1:密码批准从「极高风险专属」升级为**四档通用方式**
+
+- 「需批准密码」不再是极高风险专属:低 / 中 / 高 / 极高**任一档**都能选 `password`;
+- 入口从「去设置页批准」升级为**插件自己的密码弹窗**(注册进 `shell.overlay`,浮在整个应用之上):挂起的调用**当场放行**,不再需要模型重试;设置页区块与 `/dsh-permission-matrix/approve` 批准页保留为等价入口;
+- 命名与配置键去「hard」化:`hardApproval.js` → `password-approval.js`、`hardApprovalPasswordHash` → `approvalPasswordHash`、`hardApprovalTtlMs` → `approvalPasswordTtlMs`;旧键**保留兼容读取**并会在下次设置密码时自动迁移,已设口令不受影响;
+- `ask` 与 `password` 明确区分:`ask` 仍是浏览器审批弹窗(点同意即放行),`password` 必须知道口令;极高风险档两者等价。
 
 ## 参考与致谢
 

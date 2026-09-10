@@ -2,7 +2,7 @@
  * 决策核心：纯函数、无 I/O、可单测。
  *
  * 判定顺序（与设计说明书 §6.1 一致）：
- *   1. HARD（极高风险）→ `deny`（默认）或 `ask`（批准密码通道，见 index.js / hard-approval.js）
+ *   1. HARD（极高风险）→ `deny`（默认）或 `password`（密码批准闸门，见 index.js / password-approval.js）
  *   2. HIGH（高风险）→ `riskPolicies.high` 策略；递归删除对工作区内路径豁免
  *   3. 工作区内结构放行（write/edit/read 且目标在会话工作区内，受保护目标除外）→ `allow`
  *   4. ALLOW 规则 → `allow`
@@ -175,10 +175,13 @@ export function classifyByRules({ toolName, args, workspace }) {
 }
 
 /**
- * 三档风险策略 + 极高风险：低 / 中 / 高 / 硬 各自可配。
- *  - low / medium / high：allow（放行）/ deny（拒绝）/ ask（转人工）；
- *  - hard（极高风险）：只允许 deny / ask（ask = 需批准密码放行，见 index.js），
+ * 四档风险策略：低 / 中 / 高 / 硬 各自可配。
+ *  - low / medium / high：allow（放行）/ deny（拒绝）/ ask（转人工弹窗）/ password（挂起等批准密码）；
+ *  - hard（极高风险）：只允许 deny / ask / password —— ask 与 password 等价（都走批准密码闸门），
  *    配置为 allow 一律按最保守的 deny 处理（fail-closed）。
+ *
+ * `password` 与 `ask` 的区别：`ask` 交给浏览器人工审批弹窗（点「同意」即放行）；
+ * `password` 由本插件挂起并弹**密码框**，只有输入正确口令才放行（见 index.js / password-approval.js）。
  *
  * 默认值刻意保守：低风险放行、中风险与高风险拒绝、极高风险拒绝。
  * @type {Readonly<{low: string, medium: string, high: string, hard: string}>}
@@ -187,7 +190,8 @@ export const DEFAULT_RISK_POLICIES = Object.freeze({ low: 'allow', medium: 'deny
 
 /** 归一化一条策略值（未知值一律按最保守的拒绝处理）。 */
 function normalizePolicy(value) {
-  return value === 'allow' || value === 'ask' ? value : 'deny'
+  if (value === 'allow' || value === 'ask' || value === 'password') return value
+  return 'deny'
 }
 
 /**
@@ -195,21 +199,23 @@ function normalizePolicy(value) {
  * @param {'low' | 'medium' | 'high' | 'hard'} level - 风险级别。
  * @param {{low?: string, medium?: string, high?: string, hard?: string}} policies - 策略表。
  * @param {string} rule - 触发该策略的规则标签（写审计）。
- * @returns {{decision: 'deny' | 'allow' | 'ask', risk: string, rule: string, note?: string}} 裁决。
+ * @returns {{decision: 'deny' | 'allow' | 'ask' | 'password', risk: string, rule: string, note?: string}} 裁决。
  */
 export function applyRiskPolicy(level, policies, rule = 'risk-policy') {
   if (level === 'hard') {
-    // 极高风险不接受 allow；只有显式配置 ask 才转人工（批准密码），其余一律拒绝。
-    const decision = policies?.hard === 'ask' ? 'ask' : 'deny'
+    // 极高风险不接受 allow；ask 与 password 都是「必须输批准密码」，其余一律拒绝。
+    const configured = policies?.hard === 'ask' || policies?.hard === 'password'
+    const decision = configured ? 'password' : 'deny'
     return {
       decision,
       risk: 'hard',
-      rule: decision === 'ask' ? `${rule}:hard:ask` : 'hard-boundary',
-      note: decision === 'ask' ? '极高风险需批准密码才能放行' : '极高风险固定拒绝（人工也不能批准）',
+      rule: configured ? `${rule}:hard:password` : 'hard-boundary',
+      note: configured ? '极高风险需批准密码才能放行' : '极高风险固定拒绝（人工也不能批准）',
     }
   }
   const policy = normalizePolicy(policies?.[level])
-  const decision = policy === 'allow' ? 'allow' : policy === 'ask' ? 'ask' : 'deny'
+  // ask（转人工弹窗）与 password（挂起等密码）是两种不同处置，不能混为一谈。
+  const decision = policy === 'allow' ? 'allow' : policy === 'deny' ? 'deny' : policy === 'ask' ? 'ask' : 'password'
   return { decision, risk: level, rule: `${rule}:${level}:${decision}` }
 }
 

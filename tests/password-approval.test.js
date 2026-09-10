@@ -1,23 +1,23 @@
 /**
- * 极高风险「批准密码」模块单测：哈希、令牌一次性、指纹绑定、TTL。
- * 运行：node --test tests/hard-approval.test.js
+ * 「密码批准」模块单测：哈希、令牌一次性、指纹绑定、TTL、挂起等待。
+ * 运行：node --test tests/password-approval.test.js
  */
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { hashPassword, makeHardApproval, verifyPassword } from '../src/hard-approval.js'
+import { hashPassword, makePasswordApproval, verifyPassword } from '../src/password-approval.js'
 
 /** 构造「配置 + 管理器」（配置对象可变，模拟 settings 热覆盖）。 */
 function makeManager(overrides = {}, clock) {
-  const config = { hardApprovalPasswordHash: '', hardApprovalTtlMs: 300000, ...overrides }
-  return { config, manager: makeHardApproval(() => config, undefined, clock) }
+  const config = { approvalPasswordHash: '', approvalPasswordTtlMs: 300000, ...overrides }
+  return { config, manager: makePasswordApproval(() => config, undefined, clock) }
 }
 
 /** 设置一个可用口令，返回明文。 */
 function armPassword(manager, config, plain = 'secret-pass') {
   const prepared = manager.preparePassword({ newPassword: plain, confirmPassword: plain })
   assert.equal(prepared.ok, true)
-  config.hardApprovalPasswordHash = prepared.hash
+  config.approvalPasswordHash = prepared.hash
   return plain
 }
 
@@ -118,7 +118,7 @@ test('authorizeNext：通配令牌放行任意极高风险操作一次', () => {
 
 test('TTL：过期令牌不可消费（注入时钟）', () => {
   let now = 1_000_000
-  const { config, manager } = makeManager({ hardApprovalTtlMs: 60000 }, () => now)
+  const { config, manager } = makeManager({ approvalPasswordTtlMs: 60000 }, () => now)
   const plain = armPassword(manager, config)
 
   const { id } = manager.registerRequest({ sessionId: 's1', fingerprint: 'f', toolName: 'pwsh' })
@@ -139,6 +139,59 @@ test('snapshot：只暴露状态，不含口令哈希', () => {
   const snap = manager.snapshot()
   assert.equal(snap.passwordSet, true)
   assert.equal(snap.ttlMs, 300000)
-  assert.equal(JSON.stringify(snap).includes(config.hardApprovalPasswordHash), false, '快照不得包含哈希')
+  assert.equal(JSON.stringify(snap).includes(config.approvalPasswordHash), false, '快照不得包含哈希')
   assert.equal(JSON.stringify(snap).includes('secret-pass'), false, '快照不得包含明文')
+})
+
+// ── 在审批瀑布里挂起等密码（弹窗填写的关键路径） ───────────────────────────
+
+test('waitForDecision：密码批准 → allowed，并标记 waiting 状态', async () => {
+  const { config, manager } = makeManager()
+  const plain = armPassword(manager, config)
+  const { id } = manager.registerRequest({ sessionId: 's1', fingerprint: 'f', toolName: 'pwsh' })
+
+  const waiting = manager.waitForDecision({ requestId: id, timeoutMs: 1000 })
+  assert.equal(manager.snapshot().pending[0].waiting, true, '挂起中应标记 waiting')
+
+  const approved = manager.approveRequest({ requestId: id, password: plain })
+  assert.equal(approved.ok, true)
+  assert.equal(approved.delivered, 'call', '有等待者时应直接交付给该调用')
+  assert.equal(await waiting, 'allowed')
+  assert.equal(manager.snapshot().pending.length, 0, '放行后请求离开列表')
+  assert.equal(manager.snapshot().grants.length, 0, '直接交付不签令牌')
+})
+
+test('waitForDecision：超时 → timeout；无等待者时批准改为签令牌', async () => {
+  const { config, manager } = makeManager({ approvalPasswordTtlMs: 30 })
+  const plain = armPassword(manager, config)
+  const { id } = manager.registerRequest({ sessionId: 's1', fingerprint: 'f', toolName: 'pwsh' })
+
+  const waiting = manager.waitForDecision({ requestId: id, timeoutMs: 30 })
+  assert.equal(await waiting, 'timeout', '超时按 timeout 结算')
+  assert.equal(manager.snapshot().pending[0].waiting, false)
+
+  const approved = manager.approveRequest({ requestId: id, password: plain })
+  assert.equal(approved.delivered, 'grant', '事后批准退化为令牌')
+  assert.equal(manager.snapshot().grants.length, 1)
+})
+
+test('waitForDecision：dismiss → declined；signal 中止 → cancelled', async () => {
+  const { config, manager } = makeManager()
+  armPassword(manager, config)
+
+  const first = manager.registerRequest({ sessionId: 's1', fingerprint: 'f', toolName: 'pwsh' })
+  const waitingFirst = manager.waitForDecision({ requestId: first.id, timeoutMs: 1000 })
+  manager.dismissRequest(first.id)
+  assert.equal(await waitingFirst, 'declined', '忽略应结算为 declined')
+
+  const second = manager.registerRequest({ sessionId: 's1', fingerprint: 'g', toolName: 'pwsh' })
+  const controller = new AbortController()
+  const waitingSecond = manager.waitForDecision({ requestId: second.id, timeoutMs: 1000, signal: controller.signal })
+  controller.abort()
+  assert.equal(await waitingSecond, 'cancelled', '调用被取消应结算为 cancelled')
+
+  const third = manager.registerRequest({ sessionId: 's1', fingerprint: 'h', toolName: 'pwsh' })
+  const aborted = new AbortController()
+  aborted.abort()
+  assert.equal(await manager.waitForDecision({ requestId: third.id, timeoutMs: 1000, signal: aborted.signal }), 'cancelled')
 })

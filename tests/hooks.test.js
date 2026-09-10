@@ -112,8 +112,8 @@ function makeConfig(overrides = {}) {
     enabled: true,
     takeover: { 'fa-auto': 'auto-allow', 'ww-classify': 'classify', 'fa-classify': 'classify' },
     riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'deny' },
-    hardApprovalPasswordHash: '',
-    hardApprovalTtlMs: 300000,
+    approvalPasswordHash: '',
+    approvalPasswordTtlMs: 300000,
     llmJudge: false,
     judgeProvider: '',
     judgeModel: '',
@@ -256,11 +256,11 @@ test('总开关关闭：不注册任何钩子', () => {
 test('Config：riskPolicies.hard 默认 deny；批准密码默认未设置', () => {
   const parsed = Config({})
   assert.equal(parsed.riskPolicies.hard, 'deny')
-  assert.equal(parsed.hardApprovalPasswordHash, '')
-  assert.equal(parsed.hardApprovalTtlMs, 300000)
+  assert.equal(parsed.approvalPasswordHash, '')
+  assert.equal(parsed.approvalPasswordTtlMs, 300000)
 })
 
-test('极高风险（hard=ask）未设置批准密码：直接拒绝，不给任何放行路径', async () => {
+test('极高风险（hard=ask）未设置批准密码：挂起为 ask，并提示先设置密码', async () => {
   const config = makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, llmJudge: false })
   const { ctx, handlers } = makeFakeCtx({ s1: 'ww-classify' }, { config })
   apply(ctx, config)
@@ -268,52 +268,89 @@ test('极高风险（hard=ask）未设置批准密码：直接拒绝，不给任
   const session = sessionOf('s1')
 
   const result = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
-  assert.equal(result.kind, 'deny', '极高风险必须被拦截（不再是 ask 弹窗）')
-  assert.match(result.reason, /极高风险批准密码/)
+  assert.equal(result.kind, 'ask', '极高风险挂起等密码，而不是交给浏览器审批')
+  assert.match(result.reason, /需批准密码/)
   assert.match(result.reason, /尚未设置/)
 })
 
-test('极高风险批准密码：设置密码 → 批准待批准请求 → 同一操作放行一次（端到端）', async () => {
+test('极高风险批准密码：弹窗输入密码 → 被挂起的调用立即放行（端到端）', async () => {
   const config = makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, llmJudge: false })
   const { ctx, handlers, routes, mutations } = makeFakeCtx({ s1: 'ww-classify' }, { web: true, config })
   apply(ctx, config)
   const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
   const session = sessionOf('s1')
-  const call = { name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session } }
 
-  // 1) 拦截并登记待批准请求
-  const blocked = await pre({ ...call, callId: 'c1' }, allowNext)
-  assert.equal(blocked.kind, 'deny')
-
-  // 2) 设置批准密码：哈希写入 settings，明文既不落盘也不回传
-  const setRes = await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  // 设置批准密码：哈希写入 settings，明文既不落盘也不回传
+  const setRes = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'set-password', newPassword: 'probe-pass-123', confirmPassword: 'probe-pass-123' },
   })
   assert.equal(setRes.status, 200)
-  assert.equal(setRes.body.ok, true)
   assert.equal(setRes.body.passwordSet, true)
   assert.ok(
-    mutations.some((entry) => entry.ops.some((op) => op.path[0] === 'hardApprovalPasswordHash')),
+    mutations.some((entry) => entry.ops.some((op) => op.path[0] === 'approvalPasswordHash')),
     '哈希必须经 settings 写入',
   )
   assert.ok(!JSON.stringify(setRes.body).includes('probe-pass-123'), '响应里不得出现明文口令')
 
-  // 3) 用密码批准那条请求
-  const listRes = await callRoute(routes, '/dsh-permission-matrix/hard-approval')
-  assert.equal(listRes.body.pending.length, 1, '拦截后应出现一条待批准请求')
-  const approveRes = await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  // 1) 极高风险 → ask（登记待批准请求并挂起）
+  const asked = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(asked.kind, 'ask')
+
+  // 2) DSH 发起审批：插件挂起等密码，**不调 next()**（浏览器审批弹窗不参与）
+  let downstreamCalled = false
+  const pendingApproval = approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: asked.reason }, () => {
+    downstreamCalled = true
+    return Promise.resolve('unavailable')
+  })
+
+  // 3) 用户在弹窗里输入密码（经 /hard-approval 路由，与 GUI 弹窗同一条通道）
+  const list = await callRoute(routes, '/dsh-permission-matrix/password-approval')
+  assert.equal(list.body.pending.length, 1, '挂起后应出现一条待批准请求')
+  assert.equal(list.body.pending[0].waiting, true, '该请求应标记为「等待中」')
+  const approveRes = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
-    body: { action: 'approve', requestId: listRes.body.pending[0].id, password: 'probe-pass-123' },
+    body: { action: 'approve', requestId: list.body.pending[0].id, password: 'probe-pass-123' },
   })
   assert.equal(approveRes.status, 200)
-  assert.equal(approveRes.body.grants.length, 1)
+  assert.equal(approveRes.body.delivered, 'call', '应把放行直接交给挂起的那次调用')
 
-  // 4) 模型重新执行同一操作 → 放行；令牌用后即焚
-  const passed = await pre({ ...call, callId: 'c2' }, allowNext)
-  assert.equal(passed.kind, 'allow', '批准后重新执行必须放行')
-  const again = await pre({ ...call, callId: 'c3' }, allowNext)
-  assert.equal(again.kind, 'deny', '令牌一次性，再次执行需重新批准')
+  // 4) 被挂起的调用立刻拿到 allowed-once，且没惊动浏览器应答者
+  assert.equal(await pendingApproval, 'allowed-once')
+  assert.equal(downstreamCalled, false, '极高风险不得走人工审批应答者')
+})
+
+test('任意风险档都能选「密码批准」：以中风险为例，挂起 → 输密码 → 立即放行', async () => {
+  const config = makeConfig({ riskPolicies: { low: 'allow', medium: 'password', high: 'deny', hard: 'deny' }, llmJudge: false })
+  const { ctx, handlers, routes } = makeFakeCtx({ s1: 'ww-classify' }, { web: true, config })
+  apply(ctx, config)
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'set-password', newPassword: 'probe-pass-123', confirmPassword: 'probe-pass-123' },
+  })
+
+  // 工作区外的 write：规则未命中 + 裁判关闭 → 落到中风险档
+  const call = { name: 'write', arguments: { file_path: 'D:\\outside\\a.txt' }, agent: { session } }
+  const asked = await pre({ ...call, callId: 'c1' }, allowNext)
+  assert.equal(asked.kind, 'ask', '中风险档配 password 时应挂起等密码')
+  assert.match(asked.reason, /中风险操作需批准密码/)
+
+  const pendingApproval = approval({ agent: { session }, toolName: 'write', callId: 'c1', reason: asked.reason }, () => Promise.resolve('unavailable'))
+  const list = await callRoute(routes, '/dsh-permission-matrix/password-approval')
+  assert.equal(list.body.pending.length, 1)
+  assert.equal(list.body.pending[0].risk, 'medium', '待批准请求应记录风险级别')
+
+  const res = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'approve', requestId: list.body.pending[0].id, password: 'probe-pass-123' },
+  })
+  assert.equal(res.body.delivered, 'call')
+  assert.equal(await pendingApproval, 'allowed-once', '中风险档同样凭密码当场放行')
 })
 
 test('极高风险批准密码：口令错误不放行；令牌只绑定被批准的那个操作', async () => {
@@ -323,34 +360,89 @@ test('极高风险批准密码：口令错误不放行；令牌只绑定被批�
   const pre = handlers.get('tools/pre-execute')
   const session = sessionOf('s1')
 
-  await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'set-password', newPassword: 'right-pass-1', confirmPassword: 'right-pass-1' },
   })
 
-  const blocked = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
-  assert.equal(blocked.kind, 'deny')
-  const list = await callRoute(routes, '/dsh-permission-matrix/hard-approval')
+  const asked = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(asked.kind, 'ask')
+  const list = await callRoute(routes, '/dsh-permission-matrix/password-approval')
   const requestId = list.body.pending[0].id
 
-  const wrong = await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  const wrong = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'approve', requestId, password: 'wrong-pass' },
   })
   assert.equal(wrong.status, 400)
   assert.equal(wrong.body.ok, false)
 
-  const granted = await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  // 此刻没有等待者（调用已经结束）→ 批准签的是令牌，供模型重试使用
+  const granted = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'approve', requestId, password: 'right-pass-1' },
   })
   assert.equal(granted.body.ok, true)
+  assert.equal(granted.body.delivered, 'grant')
 
   const other = await pre({ name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force C:\\' }, agent: { session }, callId: 'c2' }, allowNext)
-  assert.equal(other.kind, 'deny', '令牌绑定指纹，不覆盖别的极高风险操作')
+  assert.equal(other.kind, 'ask', '令牌绑定指纹，不覆盖别的极高风险操作')
 
   const same = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c3' }, allowNext)
   assert.equal(same.kind, 'allow', '被批准的那条操作才放行')
+})
+
+test('极高风险批准密码：超时未批准 → 拒绝；事后批准可生成令牌供重试放行', async () => {
+  const config = makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, approvalPasswordTtlMs: 60, llmJudge: false })
+  const { ctx, handlers, routes } = makeFakeCtx({ s1: 'ww-classify' }, { web: true, config })
+  apply(ctx, config)
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+  const call = { name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session } }
+
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'set-password', newPassword: 'right-pass-1', confirmPassword: 'right-pass-1' },
+  })
+
+  const asked = await pre({ ...call, callId: 'c1' }, allowNext)
+  assert.equal(asked.kind, 'ask')
+  const outcome = await approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: asked.reason }, () => Promise.resolve('unavailable'))
+  assert.equal(outcome, 'rejected', '窗口内没等到密码 → 按拒绝处理')
+
+  const list = await callRoute(routes, '/dsh-permission-matrix/password-approval')
+  assert.equal(list.body.pending.length, 1, '超时后请求仍保留，用户可事后批准')
+  const res = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'approve', requestId: list.body.pending[0].id, password: 'right-pass-1' },
+  })
+  assert.equal(res.body.delivered, 'grant')
+  assert.equal((await pre({ ...call, callId: 'c2' }, allowNext)).kind, 'allow', '事后批准 → 模型重试即放行')
+})
+
+test('极高风险批准密码：忽略（dismiss）→ 挂起的调用立即按拒绝处理', async () => {
+  const config = makeConfig({ riskPolicies: { low: 'allow', medium: 'deny', high: 'deny', hard: 'ask' }, llmJudge: false })
+  const { ctx, handlers, routes } = makeFakeCtx({ s1: 'ww-classify' }, { web: true, config })
+  apply(ctx, config)
+  const pre = handlers.get('tools/pre-execute')
+  const approval = handlers.get('approval/request')
+  const session = sessionOf('s1')
+
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'set-password', newPassword: 'right-pass-1', confirmPassword: 'right-pass-1' },
+  })
+
+  const asked = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
+  assert.equal(asked.kind, 'ask')
+  const pendingApproval = approval({ agent: { session }, toolName: 'pwsh', callId: 'c1', reason: asked.reason }, () => Promise.resolve('unavailable'))
+  const list = await callRoute(routes, '/dsh-permission-matrix/password-approval')
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
+    method: 'POST',
+    body: { action: 'dismiss', requestId: list.body.pending[0].id },
+  })
+  assert.equal(await pendingApproval, 'rejected', '忽略应让挂起的调用立刻失败')
 })
 
 test('极高风险批准密码：授权「下一次」为通配令牌，放行一次后失效', async () => {
@@ -360,11 +452,11 @@ test('极高风险批准密码：授权「下一次」为通配令牌，放行�
   const pre = handlers.get('tools/pre-execute')
   const session = sessionOf('s1')
 
-  await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'set-password', newPassword: 'right-pass-1', confirmPassword: 'right-pass-1' },
   })
-  const auth = await callRoute(routes, '/dsh-permission-matrix/hard-approval', {
+  const auth = await callRoute(routes, '/dsh-permission-matrix/password-approval', {
     method: 'POST',
     body: { action: 'authorize-next', password: 'right-pass-1' },
   })
@@ -373,7 +465,7 @@ test('极高风险批准密码：授权「下一次」为通配令牌，放行�
   const first = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
   assert.equal(first.kind, 'allow')
   const second = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c2' }, allowNext)
-  assert.equal(second.kind, 'deny', '通配令牌同样只用一次')
+  assert.equal(second.kind, 'ask', '通配令牌同样只用一次，第二次回到等密码')
 })
 
 test('自动同意档 + hard=ask：极高风险不被自动放行，走批准密码闸门', async () => {
@@ -384,8 +476,8 @@ test('自动同意档 + hard=ask：极高风险不被自动放行，走批准密
   const session = sessionOf('s1')
 
   const blocked = await pre({ name: 'pwsh', arguments: { command: 'rm -rf /' }, agent: { session }, callId: 'c1' }, allowNext)
-  assert.equal(blocked.kind, 'deny', '自动同意档也不得放行极高风险')
-  assert.match(blocked.reason, /极高风险批准密码/)
+  assert.equal(blocked.kind, 'ask', '自动同意档也不得自动放行极高风险')
+  assert.match(blocked.reason, /需批准密码/)
 })
 
 test('自动同意档 + hard=deny：极高风险保持直接拒绝（现状不变）', async () => {

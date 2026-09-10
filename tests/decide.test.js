@@ -335,17 +335,22 @@ test('surface 识别：引号内路径保留、引号内关键词剥离', () => 
   assert.equal(classifyByRules(cmd('apt-get install "pkg"'))?.risk, 'hard')
 })
 
-// ── 极高风险档策略（新增） ─────────────────────────────────────────────────
+// ── 四档策略：password（密码批准）与 fail-closed ───────────────────────────
 
-test('极高风险策略：只允许 deny/ask，allow 一律 fail-closed 拒绝', () => {
+test('极高风险策略：只允许 deny / ask / password，allow 一律 fail-closed 拒绝', () => {
   assert.equal(applyRiskPolicy('hard', { hard: 'deny' }).decision, 'deny')
   assert.equal(applyRiskPolicy('hard', { hard: 'deny' }).rule, 'hard-boundary')
-  assert.equal(applyRiskPolicy('hard', { hard: 'ask' }).decision, 'ask')
-  assert.equal(applyRiskPolicy('hard', { hard: 'ask' }).rule, 'risk-policy:hard:ask')
+  assert.equal(applyRiskPolicy('hard', { hard: 'ask' }).decision, 'password', '旧值 ask 等价于密码批准')
+  assert.equal(applyRiskPolicy('hard', { hard: 'password' }).decision, 'password')
+  assert.equal(applyRiskPolicy('hard', { hard: 'password' }).rule, 'risk-policy:hard:password')
   assert.equal(applyRiskPolicy('hard', { hard: 'allow' }).decision, 'deny', 'hard 不允许 allow')
   assert.equal(applyRiskPolicy('hard', {}).decision, 'deny', '缺省 deny')
-  // 三档原有行为不受影响
+  // 低 / 中 / 高：四值可用（password = 挂起等密码）
   assert.equal(applyRiskPolicy('high', { high: 'ask' }).decision, 'ask')
+  assert.equal(applyRiskPolicy('high', { high: 'password' }).decision, 'password')
+  assert.equal(applyRiskPolicy('medium', { medium: 'password' }).decision, 'password')
+  assert.equal(applyRiskPolicy('low', { low: 'password' }).decision, 'password')
   assert.equal(applyRiskPolicy('medium', {}).decision, 'deny')
   assert.equal(applyRiskPolicy('low', { low: 'allow' }).decision, 'allow')
+  assert.equal(applyRiskPolicy('medium', { medium: 'nonsense' }).decision, 'deny', '未知值按最保守处理')
 })
