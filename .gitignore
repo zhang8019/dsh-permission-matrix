@@ -9,6 +9,8 @@ node_modules/
 Thumbs.db
 
 # 本地验证用（不入库）
+_*.ps1
+_*.mjs
 _p0-verify.patch.yml
 _restart-dsh.ps1
 _kb-*.mjs
